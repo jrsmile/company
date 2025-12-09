@@ -1,0 +1,303 @@
+---
+services:
+  agola:
+    image: "sorintlab/agola"
+    container_name: agola
+    hostname: 'agola'
+    command: serve --components all-base,executor
+    configs:
+      - source: agola
+        target: /config.yml
+    networks:
+      net1:
+        ipv4_address: 172.30.0.2
+    # ports:
+    #   - "8000:8000"
+    volumes:
+      - agola-data:/data/agola
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      pre-install:
+        condition: service_completed_successfully
+      s3:
+        condition: service_healthy
+        restart: true
+    restart: always
+    user: "1000:1000"
+
+  softserve:
+    image: charmcli/soft-serve:latest
+    container_name: softserve
+    hostname: 'softserve'
+    restart: always
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+    configs:
+      - source: softserve
+        target: /data/config.yml
+    networks:
+      net1:
+        ipv4_address: 172.30.0.3
+    volumes:
+      - softserve-data:/data
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    # ports:
+    #   - "3000:3000"
+    #   - "2222:22"
+  master:
+    image: chrislusf/seaweedfs # use a remote image
+    container_name: master
+    hostname: 'master'
+    ports:
+      - 9333:9333
+      - 19333:19333
+      - 9324:9324
+    command: 'master -ip=master -ip.bind=0.0.0.0 -metricsPort=9324'
+    networks:
+      net1:
+        ipv4_address: 172.30.0.4
+  volume:
+    image: chrislusf/seaweedfs # use a remote image
+    container_name: volume
+    hostname: 'volume'
+    ports:
+      - 8080:8080
+      - 18080:18080
+      - 9325:9325
+    command: 'volume -ip=volume -mserver="master:9333" -ip.bind=0.0.0.0 -port=8080 -metricsPort=9325'
+    networks:
+      net1:
+        ipv4_address: 172.30.0.5
+    depends_on:
+      - master
+  filer:
+    image: chrislusf/seaweedfs # use a remote image
+    container_name: filer
+    hostname: 'filer'
+    ports:
+      - 8888:8888
+      - 18888:18888
+      - 9326:9326
+    command: 'filer -ip=filer -master="master:9333" -ip.bind=0.0.0.0 -metricsPort=9326'
+    networks:
+      net1:
+        ipv4_address: 172.30.0.6
+    tty: true
+    stdin_open: true
+    depends_on:
+      - master
+      - volume
+  s3:
+    image: chrislusf/seaweedfs # use a remote image
+    container_name: s3
+    hostname: 's3'
+    ports:
+      - 8333:8333
+      - 9327:9327
+    command: 's3 -filer="filer:8888" -ip.bind=0.0.0.0 -metricsPort=9327 -iam.config=/etc/seaweed/iam_dex.json'
+    configs:
+      - source: seaweed_iam
+        target: /etc/seaweed/iam_dex.json
+    networks:
+      net1:
+        ipv4_address: 172.30.0.7
+    depends_on:
+      - master
+      - volume
+      - filer
+    healthcheck:
+      test: ["CMD-SHELL", "sleep 29"]
+      interval: 10s
+      retries: 5
+      start_period: 30s
+      timeout: 30s
+  webdav:
+    image: chrislusf/seaweedfs # use a remote image
+    container_name: webdav
+    hostname: 'webdav'
+    ports:
+      - 7333:7333
+    command: 'webdav -filer="filer:8888"'
+    networks:
+      net1:
+        ipv4_address: 172.30.0.8
+    depends_on:
+      - master
+      - volume
+      - filer
+  semaphore:
+    ports:
+      - 3000:3000
+    image: semaphoreui/semaphore:v2.16.43
+    container_name: semaphore
+    hostname: 'semaphore'
+    environment:
+      SEMAPHORE_DB_DIALECT: sqlite
+      SEMAPHORE_ADMIN: admin
+      SEMAPHORE_ADMIN_PASSWORD: admin
+      SEMAPHORE_ADMIN_NAME: admin
+      SEMAPHORE_ADMIN_EMAIL: admin@localhost
+      SEMAPHORE_USE_REMOTE_RUNNER: "True"
+      SEMAPHORE_RUNNER_REGISTRATION_TOKEN: "fSsb/vPLW4kuPDdITgF2j+FndEGGGHPSEV3xcsmDK0U="
+    volumes:
+      - semaphore_data:/var/lib/semaphore
+      - semaphore_config:/etc/semaphore
+      - semaphore_tmp:/tmp/semaphore
+    networks:
+      net1:
+        ipv4_address: 172.30.0.9
+  semaphore-runner:
+    image: semaphoreui/runner:v2.16.43
+    container_name: semaphore-runner
+    hostname: 'semaphore-runner'
+    environment:
+      SEMAPHORE_RUNNER_PRIVATE_KEY_FILE: /var/lib/semaphore/runner.key
+      SEMAPHORE_WEB_ROOT: http://semaphore:3000
+      SEMAPHORE_RUNNER_REGISTRATION_TOKEN: fSsb/vPLW4kuPDdITgF2j+FndEGGGHPSEV3xcsmDK0U=
+    networks:
+      net1:
+        ipv4_address: 172.30.0.10
+
+  dex:
+    image: dexidp/dex:latest
+    container_name: dex
+    hostname: 'dex'
+    ports:
+      - "5556:5556"
+    configs:
+      - source: dex
+        target: /etc/dex/config.yaml
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    networks:
+      net1:
+        ipv4_address: 172.30.0.11
+
+  ca:
+    image: 'smallstep/step-ca:latest'
+    container_name: 'ca'
+    hostname: 'ca'
+    networks:
+      net1:
+        ipv4_address: 172.30.0.12
+    ports:
+      - 9000:9000
+#    dns:
+#      - '${DNS1}'
+#      - '${DNS2}'
+    dns_search:
+      - '.internal'
+    environment:
+      # Name of Cert Authority (i.e., PrivateCorp CA). Visible on all issued certs.
+      - "DOCKER_STEPCA_INIT_NAME=Local CA"
+      # Comma-separated list of hostnames/IP addresses the CA will accept requests on
+      - "DOCKER_STEPCA_INIT_DNS_NAMES=*"
+      # Name for the initial provisioner. Default is 'admin' if left null.
+      - "DOCKER_STEPCA_INIT_PROVISIONER_NAME=admin"
+      # Specify a password for encrypted CA Keys & Default CA Provisioner
+      - "DOCKER_STEPCA_INIT_PASSWORD=admin"
+      # Set this to any non-null value to enable SSH cert support
+      - "DOCKER_STEPCA_INIT_SSH=true"
+    volumes:
+      - 'step:/home/step'
+
+  caddy:
+    image: caddy:latest
+    container_name: 'caddy'
+    hostname: 'caddy'
+    ports:
+      - 80:80
+      - 443:443
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+    volumes:
+      - ./certs:/data
+    restart: always
+    networks:
+      net1:
+        ipv4_address: 172.30.0.13
+
+  dns:
+    image: defreitas/dns-proxy-server
+    container_name: 'dns'
+    hostname: 'dns'
+    volumes:
+      - '/var/run/docker.sock:/var/run/docker.sock'
+    ports:
+      - '5380:5380'
+      - '5354:53/udp'
+      - '5354:53/tcp'
+    restart: unless-stopped
+    networks:
+      net1:
+        ipv4_address: 172.30.0.14
+
+  dockpeek:
+    image: dockpeek/dockpeek:latest
+    container_name: dockpeek
+    hostname: 'dockpeek'
+    environment:
+      - SECRET_KEY=your_secure_secret_key # Required: Set a secure secret key
+      - USERNAME=admin # username
+      - PASSWORD=admin # password
+    # Server name for UI (optional, auto-detected from Docker API if not set)
+    #  - DOCKER_HOST_NAME=
+    ports:
+      - "3420:8000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    networks:
+      net1:
+        ipv4_address: 172.30.0.15
+
+  pre-install:
+      command: 'chroot /host /bin/bash -c "docker plugin install --grant-all-permissions ghcr.io/studioetrange/bindfs:latest || true && docker plugin enable ghcr.io/studioetrange/bindfs:latest || exit 0"'
+      image: busybox
+      container_name: 'pre-install'
+      hostname: 'pre-install'
+      volumes:
+          - '/:/host'
+      ipc: host
+      pid: host
+      network_mode: "host"
+      privileged: true
+      tty: true
+      restart: "no"
+
+networks:
+  net1:
+    name: company
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.30.0.0/16
+          gateway: 172.30.0.1
+
+volumes:
+  agola-data:
+  softserve-data:
+  semaphore_data:
+  semaphore_config:
+  semaphore_tmp:
+  dockge:
+  step:
+  data:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/agola"
+        map: "1000/0:@1000/@0"
+
+configs:
+  agola:
+    file: ./agola/config.yml
+  softserve:
+    file: ./softserve/config.yml
+  dex:
+    file: ./dex/config.yml
+  seaweed_iam:
+    file: ./seaweedfs/iam_dex.json
+  caddyfile:
+    file: ./caddy/Caddyfile
