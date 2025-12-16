@@ -1,51 +1,74 @@
 ---
 services:
-  agola:
-    image: "sorintlab/agola"
-    container_name: agola
-    hostname: 'agola'
-    command: serve --components all-base,executor
-    configs:
-      - source: agola
-        target: /config.yml
+  pre-install:
+      command: 'chroot /host /bin/bash -c "docker plugin install --grant-all-permissions ghcr.io/studioetrange/bindfs:latest || true && docker plugin enable ghcr.io/studioetrange/bindfs:latest || exit 0"'
+      image: busybox
+      container_name: 'pre-install'
+      hostname: 'pre-install'
+      volumes:
+          - '/:/host'
+      ipc: host
+      pid: host
+      network_mode: "host"
+      privileged: true
+      tty: true
+      restart: "no"
+  woodpecker-server:
+    image: woodpeckerci/woodpecker-server:v3
+    container_name: woodpecker-server
+    hostname: 'woodpecker-server'
+    ports:
+      - 8000:8000
+    volumes:
+      - woodpecker-server-data:/var/lib/woodpecker/
+    environment:
+      - WOODPECKER_OPEN=true
+      - WOODPECKER_HOST=http://172.30.0.20:8000
+      - WOODPECKER_AGENT_SECRET=pssst
+      - WOODPECKER_GITEA=true
+      - WOODPECKER_GITEA_URL=http://172.30.0.3
+      - WOODPECKER_GITEA_CLIENT=YOUR_GITEA_CLIENT
+      - WOODPECKER_GITEA_SECRET=YOUR_GITEA_CLIENT_SECRET
     networks:
       net1:
-        ipv4_address: 172.30.0.2
-    # ports:
-    #   - "8000:8000"
-    volumes:
-      - agola-data:/data/agola
-      - /var/run/docker.sock:/var/run/docker.sock
-    depends_on:
-      pre-install:
-        condition: service_completed_successfully
-      s3:
-        condition: service_healthy
-        restart: true
-    restart: always
-    user: "1000:1000"
+        ipv4_address: 172.30.0.21
 
-  softserve:
-    image: charmcli/soft-serve:latest
-    container_name: softserve
-    hostname: 'softserve'
+  woodpecker-agent:
+    image: woodpeckerci/woodpecker-agent:v3
+    container_name: woodpecker-agent
+    hostname: 'woodpecker-agent'
+    command: agent
     restart: always
+    depends_on:
+      - woodpecker-server
+    volumes:
+      - woodpecker-agent-config:/etc/woodpecker
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WOODPECKER_SERVER=172.30.0.20:9000
+      - WOODPECKER_AGENT_SECRET=pssst
+    networks:
+      net1:
+        ipv4_address: 172.30.0.22
+
+  gitea:
+    image: docker.gitea.com/gitea:1.25.2
+    container_name: gitea
+    hostname: 'gitea'
     environment:
       - USER_UID=1000
       - USER_GID=1000
-    configs:
-      - source: softserve
-        target: /data/config.yml
+    restart: always
+    volumes:
+      - ./gitea:/data
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "3100:3000"
+      - "222:22"
     networks:
       net1:
         ipv4_address: 172.30.0.3
-    volumes:
-      - softserve-data:/data
-      - /etc/timezone:/etc/timezone:ro
-      - /etc/localtime:/etc/localtime:ro
-    # ports:
-    #   - "3000:3000"
-    #   - "2222:22"
   master:
     image: chrislusf/seaweedfs # use a remote image
     container_name: master
@@ -129,7 +152,7 @@ services:
       - filer
   semaphore:
     ports:
-      - 3000:3000
+      - 3010:3000
     image: semaphoreui/semaphore:v2.16.43
     container_name: semaphore
     hostname: 'semaphore'
@@ -182,7 +205,7 @@ services:
       net1:
         ipv4_address: 172.30.0.12
     ports:
-      - 9000:9000
+      - 9020:9000
 #    dns:
 #      - '${DNS1}'
 #      - '${DNS2}'
@@ -252,12 +275,735 @@ services:
     networks:
       net1:
         ipv4_address: 172.30.0.15
+    
+  prometheus:
+    image: prom/prometheus
+    container_name: prometheus
+    hostname: 'prometheus'
+    restart: unless-stopped
+    ports:
+      - 9090:9090
+    networks:
+      net1:
+        ipv4_address: 172.30.0.16
 
-  pre-install:
-      command: 'chroot /host /bin/bash -c "docker plugin install --grant-all-permissions ghcr.io/studioetrange/bindfs:latest || true && docker plugin enable ghcr.io/studioetrange/bindfs:latest || exit 0"'
+  grafana:
+    image: grafana/grafana-enterprise
+    container_name: grafana
+    hostname: 'grafana'
+    restart: unless-stopped
+    ports:
+      - '3001:3000'
+    networks:
+      net1:
+        ipv4_address: 172.30.0.17
+
+  alpine:
+      image: qemux/qemu
+      container_name: alpine
+      environment:
+        BOOT: "alpine"
+      devices:
+        - /dev/kvm
+        - /dev/net/tun
+      cap_add:
+        - NET_ADMIN
+      ports:
+        - 8006:8006
+      volumes:
+        - ./qemu:/storage
+      restart: always
+      stop_grace_period: 2m
+      networks:
+        net1:
+          ipv4_address: 172.30.0.18
+
+  postgres:
+    image: postgres:latest
+    container_name: postgres
+    hostname: postgres
+    restart: always
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 100
+    #read_only: true
+    tmpfs:
+      - /tmp
+      - /var/run/postgresql
+    volumes:
+      - ./postgres/:/var/lib/postgresql/
+    environment:
+      - POSTGRES_MULTIPLE_DATABASES=mattermost,mattermost# passbolt,passbolt# paperless,paperless# netbox,netbox# docmost,docmost# coder,coder
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=postgres
+      - TZ
+    configs:
+      - source: create-multiple-postgresql-databases
+        target: /docker-entrypoint-initdb.d/create-multiple-postgresql-databases.sh
+    healthcheck:
+          test:
+            [
+              "CMD-SHELL",
+              "pg_isready -U ${POSTGRES_USER:-username} -d ${POSTGRES_DB:-coder}",
+            ]
+          interval: 5s
+          timeout: 5s
+          retries: 5
+    networks:
+      net1:
+        ipv4_address: 172.30.0.19
+
+  mattermost:
+    depends_on:
+      - postgres
+    image: mattermost/mattermost-team-edition:latest
+    container_name: mattermost
+    hostname: mattermost
+    restart: always
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 200
+    read_only: false
+    tmpfs:
+      - /tmp
+    volumes:
+      - mattermost-config:/mattermost/config:rw
+      - mattermost-data:/mattermost/data:rw
+      - mattermost-logs:/mattermost/logs:rw
+      - mattermost-plugins:/mattermost/plugins:rw
+      - mattermost-client-plugins:/mattermost/client/plugins:rw
+      - mattermost-bleve:/mattermost/bleve-indexes:rw
+      # When you want to use SSO with GitLab, you have to add the cert pki chain of GitLab inside Alpine
+      # to avoid Token request failed: certificate signed by unknown authority 
+      # (link: https://github.com/mattermost/mattermost-server/issues/13059 and https://github.com/mattermost/docker/issues/34)
+      # - ${GITLAB_PKI_CHAIN_PATH}:/etc/ssl/certs/pki_chain.pem:ro
+    environment:
+      - TZ
+      # necessary Mattermost options/variables (see env.example)
+      - MM_SQLSETTINGS_DRIVERNAME=postgres
+      - MM_SQLSETTINGS_DATASOURCE=postgres://mattermost:postgres@postgres:5432/mattermost?sslmode=disable&connect_timeout=10
+      # necessary for bleve
+      - MM_BLEVESETTINGS_INDEXDIR
+      # additional settings
+      - MM_SERVICESETTINGS_SITEURL
+    ports:
+      - 8065:8065
+    networks:
+      net1:
+        ipv4_address: 172.30.0.20
+  
+  headscale:
+    image: docker.io/headscale/headscale:latest
+    restart: unless-stopped
+    container_name: headscale
+    hostname: headscale
+    ports:
+      - "127.0.0.1:8081:8080"
+      - "127.0.0.1:9091:9090"
+    volumes:
+      - ./headscale/config:/etc/headscale
+      - ./headscale/lib:/var/lib/headscale
+      - ./headscale/run:/var/run/headscale
+    command: serve
+    healthcheck:
+        test: ["CMD", "headscale", "health"]
+    networks:
+      net1:
+        ipv4_address: 172.30.0.23
+
+  passbolt:
+      image: passbolt/passbolt:latest-ce-non-root
+      container_name: passbolt
+      hostname: passbolt
+      restart: unless-stopped
+      depends_on:
+        - postgres
+      environment:
+        APP_FULL_BASE_URL: https://passbolt.local
+        DATASOURCES_DEFAULT_HOST: "postgres"
+        DATASOURCES_DEFAULT_USERNAME: "passbolt"
+        DATASOURCES_DEFAULT_PASSWORD: "P4ssb0lt"
+        DATASOURCES_DEFAULT_DATABASE: "passbolt"
+      volumes:
+        - ./passbolt/gpg_volume:/etc/passbolt/gpg
+        - ./passbolt/jwt_volume:/etc/passbolt/jwt
+      command:
+        [
+          "/usr/bin/wait-for.sh",
+          "-t",
+          "0",
+          "db:3306",
+          "--",
+          "/docker-entrypoint.sh",
+        ]
+      ports:
+      - 8088:8080
+      - 8443:4433
+      networks:
+        net1:
+          ipv4_address: 172.30.0.24
+
+  n8n:
+    image: n8nio/n8n:1.111.0
+    container_name: n8n
+    hostname: n8n
+    environment:
+      - N8N_RUNNERS_ENABLED=true
+      - N8N_RUNNERS_MODE=external
+      - N8N_RUNNERS_BROKER_LISTEN_ADDRESS=0.0.0.0
+      - N8N_RUNNERS_AUTH_TOKEN=your-secret-here
+      - N8N_NATIVE_PYTHON_RUNNER=true
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      net1:
+        ipv4_address: 172.30.0.25
+
+  n8n-runner:
+    image: n8nio/runners:1.111.0
+    container_name: n8n-runner
+    hostname: n8n-runner
+    environment:
+      - N8N_RUNNERS_TASK_BROKER_URI=http://n8n:5679
+      - N8N_RUNNERS_AUTH_TOKEN=your-secret-here
+    depends_on:
+      - n8n
+    networks:
+      net1:
+        ipv4_address: 172.30.0.26
+
+  rustdesk:
+    container_name: rustdesk
+    image: rustdesk/rustdesk-server:latest
+    environment:
+      - ALWAYS_USE_RELAY=Y
+    command: hbbs
+    volumes:
+      - ./rustdesk/hbbs/data:/root
+    network_mode: "host"
+
+    depends_on:
+      - rustdesk-relay
+    restart: unless-stopped
+
+  rustdesk-relay:
+    container_name: rustdesk-relay
+    image: rustdesk/rustdesk-server:latest
+    command: hbbr
+    volumes:
+      - ./rustdesk/hbbr/data:/root
+    network_mode: "host"
+    restart: unless-stopped
+
+  pless-redis:
+    image: docker.io/valkey/valkey:8.1-alpine
+    container_name: pless-redis
+    hostname: pless-redis
+    restart: unless-stopped
+    volumes:
+      - ./pless-redis/data:/data
+    networks:
+      net1:
+        ipv4_address: 172.30.0.27
+
+  paperless-ngx:
+    image: ghcr.io/paperless-ngx/paperless-ngx:latest
+    container_name: paperless-ngx
+    hostname: paperless-ngx
+    restart: unless-stopped
+    depends_on:
+      - postgres
+      - pless-redis
+      - gotenberg
+      - tika
+    ports:
+      - "8100:8000"
+    volumes:
+      - paperless-data:/usr/src/paperless/data
+      - paperless-media:/usr/src/paperless/media
+      - ./export:/usr/src/paperless/export
+      - ./consume:/usr/src/paperless/consume
+    environment:
+      PAPERLESS_REDIS: redis://pless-redis:6379
+      PAPERLESS_DBHOST: postgres
+      PAPERLESS_TIKA_ENABLED: 1
+      PAPERLESS_TIKA_GOTENBERG_ENDPOINT: http://gotenberg:3000
+      PAPERLESS_TIKA_ENDPOINT: http://tika:9998
+    networks:
+      net1:
+        ipv4_address: 172.30.0.28
+  gotenberg:
+    image: docker.io/gotenberg/gotenberg:8.25
+    container_name: gotenberg
+    hostname: gotenberg
+    restart: unless-stopped
+    command:
+      - "gotenberg"
+      - "--chromium-disable-javascript=true"
+      - "--chromium-allow-list=file:///tmp/.*"
+    networks:
+      net1:
+        ipv4_address: 172.30.0.29
+  tika:
+    image: docker.io/apache/tika:latest
+    container_name: tika
+    hostname: tika
+    restart: unless-stopped
+    networks:
+      net1:
+        ipv4_address: 172.30.0.30
+
+  paperless-gpt:
+    # Use one of these image sources:
+    image: icereed/paperless-gpt:latest # Docker Hub
+    container_name: paperless-gpt
+    hostname: paperless-gpt
+    # image: ghcr.io/icereed/paperless-gpt:latest  # GitHub Container Registry
+    environment:
+      PAPERLESS_BASE_URL: "http://paperless-ngx:8000"
+      PAPERLESS_API_TOKEN: "your_paperless_api_token"
+      PAPERLESS_PUBLIC_URL: "http://paperless.mydomain.com" # Optional
+      MANUAL_TAG: "paperless-gpt" # Optional, default: paperless-gpt
+      AUTO_TAG: "paperless-gpt-auto" # Optional, default: paperless-gpt-auto
+      # LLM Configuration - Choose one:
+
+      # Option 1: Standard OpenAI
+      LLM_PROVIDER: "openai"
+      LLM_MODEL: "gpt-4o"
+      OPENAI_API_KEY: "your_openai_api_key"
+
+      # Option 2: Mistral
+      # LLM_PROVIDER: "mistral"
+      # LLM_MODEL: "mistral-large-latest"
+      # MISTRAL_API_KEY: "your_mistral_api_key"
+
+      # Option 3: Azure OpenAI
+      # LLM_PROVIDER: "openai"
+      # LLM_MODEL: "your-deployment-name"
+      # OPENAI_API_KEY: "your_azure_api_key"
+      # OPENAI_API_TYPE: "azure"
+      # OPENAI_BASE_URL: "https://your-resource.openai.azure.com"
+
+      # Option 3: Ollama (Local)
+      # LLM_PROVIDER: "ollama"
+      # LLM_MODEL: "qwen3:8b"
+      # OLLAMA_HOST: "http://host.docker.internal:11434"
+      # OLLAMA_CONTEXT_LENGTH: "8192" # Sets Ollama NumCtx (context window)
+      # TOKEN_LIMIT: 1000 # Recommended for smaller models
+
+      # Optional LLM Settings
+      # LLM_LANGUAGE: "English" # Optional, default: English
+
+      # OCR Configuration - Choose one:
+      # Option 1: LLM-based OCR
+      OCR_PROVIDER: "llm" # Default OCR provider
+      VISION_LLM_PROVIDER: "ollama" # openai or ollama
+      VISION_LLM_MODEL: "minicpm-v" # minicpm-v (ollama) or gpt-4o (openai)
+      OLLAMA_HOST: "http://ollama:11434" # If using Ollama
+
+      # OCR Processing Mode
+      OCR_PROCESS_MODE: "image" # Optional, default: image, other options: pdf, whole_pdf
+      PDF_SKIP_EXISTING_OCR: "false" # Optional, skip OCR for PDFs with existing OCR
+
+      # Option 2: Google Document AI
+      # OCR_PROVIDER: 'google_docai'       # Use Google Document AI
+      # GOOGLE_PROJECT_ID: 'your-project'  # Your GCP project ID
+      # GOOGLE_LOCATION: 'us'              # Document AI region
+      # GOOGLE_PROCESSOR_ID: 'processor-id' # Your processor ID
+      # GOOGLE_APPLICATION_CREDENTIALS: '/app/credentials.json' # Path to service account key
+
+      # Option 3: Azure Document Intelligence
+      # OCR_PROVIDER: 'azure'              # Use Azure Document Intelligence
+      # AZURE_DOCAI_ENDPOINT: 'your-endpoint' # Your Azure endpoint URL
+      # AZURE_DOCAI_KEY: 'your-key'        # Your Azure API key
+      # AZURE_DOCAI_MODEL_ID: 'prebuilt-read' # Optional, defaults to prebuilt-read
+      # AZURE_DOCAI_TIMEOUT_SECONDS: '120'  # Optional, defaults to 120 seconds
+      # AZURE_DOCAI_OUTPUT_CONTENT_FORMAT: 'text' # Optional, defaults to 'text', other valid option is 'markdown'
+      # 'markdown' requires the 'prebuilt-layout' model
+
+      # Enhanced OCR Features
+      CREATE_LOCAL_HOCR: "false" # Optional, save hOCR files locally
+      LOCAL_HOCR_PATH: "/app/hocr" # Optional, path for hOCR files
+      CREATE_LOCAL_PDF: "false" # Optional, save enhanced PDFs locally
+      LOCAL_PDF_PATH: "/app/pdf" # Optional, path for PDF files
+      PDF_UPLOAD: "false" # Optional, upload enhanced PDFs to paperless-ngx
+      PDF_REPLACE: "false" # Optional and DANGEROUS, delete original after upload
+      PDF_COPY_METADATA: "true" # Optional, copy metadata from original document
+      PDF_OCR_TAGGING: "true" # Optional, add tag to processed documents
+      PDF_OCR_COMPLETE_TAG: "paperless-gpt-ocr-complete" # Optional, tag name
+
+      # Option 4: Docling Server
+      # OCR_PROVIDER: 'docling'              # Use a Docling server
+      # DOCLING_URL: 'http://your-docling-server:port' # URL of your Docling instance
+      # DOCLING_IMAGE_EXPORT_MODE: "placeholder" # Optional, defaults to "embedded"
+      # DOCLING_OCR_PIPELINE: "standard" # Optional, defaults to "vlm"
+      # DOCLING_OCR_ENGINE: "easyocr" # Optional, defaults to "easyocr" (only used when `DOCLING_OCR_PIPELINE is set to 'standard')
+
+
+      AUTO_OCR_TAG: "paperless-gpt-ocr-auto" # Optional, default: paperless-gpt-ocr-auto
+      OCR_LIMIT_PAGES: "5" # Optional, default: 5. Set to 0 for no limit.
+      LOG_LEVEL: "info" # Optional: debug, warn, error
+    volumes:
+      - ./prompts:/app/prompts # Mount the prompts directory
+      # For Google Document AI:
+      - ${HOME}/.config/gcloud/application_default_credentials.json:/app/credentials.json
+      # For local hOCR and PDF saving:
+      - ./hocr:/app/hocr # Only if CREATE_LOCAL_HOCR is true
+      - ./pdf:/app/pdf # Only if CREATE_LOCAL_PDF is true
+    ports:
+      - "8180:8080"
+    depends_on:
+      - paperless-ngx
+      - ollama
+    networks:
+      net1:
+        ipv4_address: 172.30.0.31
+
+  ollama:
+    image: docker.io/ollama/ollama:latest
+    container_name: ollama
+    hostname: ollama
+    ports:
+      - 7869:11434
+    volumes:
+      - .:/code
+      - ./ollama/ollama:/root/.ollama
+    pull_policy: always
+    tty: true
+    restart: always
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_HOST=0.0.0.0
+    networks:
+      net1:
+        ipv4_address: 172.30.0.32
+
+  it-tools:
+    container_name: it-tools
+    hostname: it-tools
+    image: sharevb/it-tools:latest
+    pull_policy: always
+    restart: unless-stopped
+    ports:
+      - 8181:8080
+    networks:
+      net1:
+        ipv4_address: 172.30.0.33
+
+  onlyoffice-documentserver:
+    build:
+      context: .
+    image: onlyoffice/documentserver #[-de,-ee]
+    container_name: onlyoffice-documentserver
+    depends_on:
+      - postgres
+      - onlyoffice-rabbitmq
+    environment:
+      - DB_TYPE=postgres
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=onlyoffice
+      - DB_USER=onlyoffice
+      - AMQP_URI=amqp://guest:guest@onlyoffice-rabbitmq
+      # Uncomment strings below to enable the JSON Web Token validation.
+      #- JWT_ENABLED=true
+      #- JWT_SECRET=secret
+      #- JWT_HEADER=Authorization
+      #- JWT_IN_BODY=true
+    ports:
+      - '4080:80'
+      - '4443:443'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/info/info.json"]
+      interval: 30s
+      retries: 5
+      start_period: 60s
+      timeout: 10s
+    stdin_open: true
+    restart: always
+    stop_grace_period: 60s
+    volumes:
+       - /var/www/onlyoffice/Data
+       - /var/log/onlyoffice
+       - /var/lib/onlyoffice/documentserver/App_Data/cache/files
+       - /var/www/onlyoffice/documentserver-example/public/files
+       - /usr/share/fonts
+    networks:
+      net1:
+        ipv4_address: 172.30.0.34
+       
+  onlyoffice-rabbitmq:
+    container_name: onlyoffice-rabbitmq
+    hostname: onlyoffice-rabbitmq
+    image: rabbitmq:3
+    restart: always
+    expose:
+      - '5672'
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "status"]
+      interval: 10s
+      retries: 3
+      start_period: 10s
+      timeout: 10s
+    networks:
+      net1:
+        ipv4_address: 172.30.0.35
+
+  netbox:
+    image: lscr.io/linuxserver/netbox:latest
+    container_name: netbox
+    hostname: netbox
+    depends_on:
+      - postgres
+      - redis
+      - redis-cache
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      - SUPERUSER_EMAIL=admin@example.com
+      - SUPERUSER_PASSWORD=admin
+      - ALLOWED_HOST=
+      - DB_NAME=netbox
+      - DB_USER=netbox
+      - DB_PASSWORD=postgres
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redis
+      - REDIS_DB_TASK=
+      - REDIS_DB_CACHE=
+      - BASE_PATH= #optional
+      - REMOTE_AUTH_ENABLED= #optional
+      - REMOTE_AUTH_BACKEND= #optional
+      - REMOTE_AUTH_HEADER= #optional
+      - REMOTE_AUTH_AUTO_CREATE_USER= #optional
+      - REMOTE_AUTH_DEFAULT_GROUPS= #optional
+      - REMOTE_AUTH_DEFAULT_PERMISSIONS= #optional
+    volumes:
+      - netbox-config:/etc/netbox/config
+    ports:
+      - 8110:8000
+    restart: unless-stopped
+    networks:
+      net1:
+        ipv4_address: 172.30.0.36
+
+  redis:
+    image: docker.io/valkey/valkey:8.1-alpine
+    container_name: redis
+    hostname: redis
+    command:
+      - sh
+      - -c # this is to evaluate the $REDIS_PASSWORD from the env
+      - valkey-server --appendonly yes --requirepass redis ## $$ because of docker-compose
+    healthcheck: &redis-healthcheck
+      test: '[ $$(valkey-cli --pass "redis" ping) = ''PONG'' ]'
+      start_period: 5s
+      timeout: 3s
+      interval: 1s
+      retries: 5
+    volumes:
+      - netbox-redis-data:/data
+    networks:
+      net1:
+        ipv4_address: 172.30.0.38
+
+  redis-cache:
+    image: docker.io/valkey/valkey:8.1-alpine
+    container_name: redis-cache
+    hostname: redis-cache
+    command:
+      - sh
+      - -c # this is to evaluate the $REDIS_PASSWORD from the env
+      - valkey-server --requirepass redis ## $$ because of docker-compose
+    healthcheck: *redis-healthcheck
+    volumes:
+      - netbox-redis-cache-data:/data
+    networks:
+      net1:
+        ipv4_address: 172.30.0.39
+  webhook:
+      command: '-verbose -hooks=/etc/webhook/hooks.json -hotreload'
+      image: lwlook/webhook
+      volumes:
+          - '/var/run/docker.sock:/var/run/docker.sock'
+          - './webhook/scripts:/opt/scripts'
+          - './webhook/webhook:/etc/webhook'
+      container_name: webhook
+      ports:
+          - '9000:9000'
+      networks:
+        net1:
+          ipv4_address: 172.30.0.42
+
+  neko:
+    image: "ghcr.io/m1k1o/neko/firefox:latest"
+    container_name: neko
+    hostname: neko
+    restart: "unless-stopped"
+    shm_size: "4gb"
+    ports:
+      - "8085:8080"
+      - "52000-52100:52000-52100/udp"
+    environment:
+      NEKO_DESKTOP_SCREEN: 1280x720@30
+      NEKO_MEMBER_MULTIUSER_USER_PASSWORD: neko
+      NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD: admin
+      NEKO_WEBRTC_EPR: 52000-52100
+      NEKO_WEBRTC_ICELITE: 1
+      NEKO_NAT1TO1: 127.0.0.1
+    networks:
+      net1:
+        ipv4_address: 172.30.0.43
+
+  wetty:
+      command: '--ssh-host=172.30.0.1'
+      image: wettyoss/wetty
+      container_name: wetty
+      hostname: wetty
+      ports:
+          - '1234:3000'
+      networks:
+        net1:
+          ipv4_address: 172.30.0.44
+  coder:
+    # This MUST be stable for our documentation and
+    # other automations.
+    image: ghcr.io/coder/coder:latest
+    container_name: coder
+    hostname: coder
+    ports:
+      - "7080:7080"
+    environment:
+      CODER_PG_CONNECTION_URL: "postgresql://coder:postgres@postgres/coder?sslmode=disable"
+      CODER_HTTP_ADDRESS: "0.0.0.0:7080"
+      # You'll need to set CODER_ACCESS_URL to an IP or domain
+      # that workspaces can reach. This cannot be localhost
+      # or 127.0.0.1 for non-Docker templates!
+      CODER_ACCESS_URL: "http://127.0.0.1:7080"
+    # If the coder user does not have write permissions on
+    # the docker socket, you can uncomment the following
+    # lines and set the group ID to one that has write
+    # permissions on the docker socket.
+    #group_add:
+    #  - "998" # docker group on host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Run "docker volume rm coder_coder_home" to reset the dev tunnel url (https://abc.xyz.try.coder.app).
+      # This volume is not required in a production environment - you may safely remove it.
+      # Coder can recreate all the files it needs on restart.
+      - coder_home:/home/coder
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  docmost:
+    image: docmost/docmost:latest
+    container_name: docmost
+    hostname: docmost
+    depends_on:
+      - postgres
+      - doc-redis
+    environment:
+      APP_URL: "http://localhost:3000"
+      APP_SECRET: "3fc0dd9af11abb9f2585049f8990b588"
+      DATABASE_URL: "postgresql://docmost:postgres@postgres:5432/docmost?schema=public"
+      REDIS_URL: "redis://doc-redis:6379"
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    volumes:
+      - docmost:/app/data/storage
+    networks:
+      net1:
+        ipv4_address: 172.30.0.40
+
+  doc-redis:
+    image: docker.io/valkey/valkey:8.1-alpine
+    container_name: doc-redis
+    hostname: doc-redis
+    restart: unless-stopped
+    volumes:
+      - doc-redis_data:/data
+    networks:
+      net1:
+        ipv4_address: 172.30.0.41
+
+  opencloud:
+    image: opencloudeu/opencloud-rolling:latest
+    # changelog: https://github.com/opencloud-eu/opencloud/tree/main/changelog
+    # release notes: https://docs.opencloud.eu/opencloud_release_notes.html
+    user: 1000
+    networks:
+      net1:
+        ipv4_address: 172.30.0.42
+    entrypoint:
+      - /bin/sh
+    # run opencloud init to initialize a configuration file with random secrets
+    # it will fail on subsequent runs, because the config file already exists
+    # therefore we ignore the error and then start the opencloud server
+    command: ["-c", "opencloud init || true; opencloud server"]
+    environment:
+      # enable services that are not started automatically
+      OC_ADD_RUN_SERVICES: ${START_ADDITIONAL_SERVICES}
+      OC_URL: https://${OC_DOMAIN:-cloud.opencloud.test}${TRAEFIK_PORT_HTTPS:+:}${TRAEFIK_PORT_HTTPS:-}
+      OC_LOG_LEVEL: ${LOG_LEVEL:-info}
+      OC_LOG_COLOR: "${LOG_PRETTY:-false}"
+      OC_LOG_PRETTY: "${LOG_PRETTY:-false}"
+      # do not use SSL between the reverse proxy and OpenCloud
+      PROXY_TLS: "false"
+      # INSECURE: needed if OpenCloud / reverse proxy is using self generated certificates
+      OC_INSECURE: "${INSECURE:-false}"
+      # basic auth (not recommended, but needed for eg. WebDav clients that do not support OpenID Connect)
+      PROXY_ENABLE_BASIC_AUTH: "${PROXY_ENABLE_BASIC_AUTH:-false}"
+      # demo users
+      IDM_CREATE_DEMO_USERS: "${DEMO_USERS:-false}"
+      # admin password
+      IDM_ADMIN_PASSWORD: "${INITIAL_ADMIN_PASSWORD}"
+      # email server (if configured)
+      NOTIFICATIONS_SMTP_HOST: "${SMTP_HOST}"
+      NOTIFICATIONS_SMTP_PORT: "${SMTP_PORT}"
+      NOTIFICATIONS_SMTP_SENDER: "${SMTP_SENDER:-OpenCloud Notifications <notifications@cloud.opencloud.test>}"
+      NOTIFICATIONS_SMTP_USERNAME: "${SMTP_USERNAME}"
+      NOTIFICATIONS_SMTP_PASSWORD: "${SMTP_PASSWORD}"
+      NOTIFICATIONS_SMTP_INSECURE: "${SMTP_INSECURE:-false}"
+      NOTIFICATIONS_SMTP_AUTHENTICATION: "${SMTP_AUTHENTICATION}"
+      NOTIFICATIONS_SMTP_ENCRYPTION: "${SMTP_TRANSPORT_ENCRYPTION:-none}"
+      FRONTEND_ARCHIVER_MAX_SIZE: "10000000000"
+      FRONTEND_CHECK_FOR_UPDATES: "${CHECK_FOR_UPDATES:-true}"
+      PROXY_CSP_CONFIG_FILE_LOCATION: /etc/opencloud/csp.yaml
+      # enable to allow using the banned passwords list
+      OC_PASSWORD_POLICY_BANNED_PASSWORDS_LIST: banned-password-list.txt
+      # control the password enforcement and policy for public shares
+      OC_SHARING_PUBLIC_SHARE_MUST_HAVE_PASSWORD: "${OC_SHARING_PUBLIC_SHARE_MUST_HAVE_PASSWORD:-true}"
+      OC_SHARING_PUBLIC_WRITEABLE_SHARE_MUST_HAVE_PASSWORD: "${OC_SHARING_PUBLIC_WRITEABLE_SHARE_MUST_HAVE_PASSWORD:-true}"
+      OC_PASSWORD_POLICY_DISABLED: "${OC_PASSWORD_POLICY_DISABLED:-false}"
+      OC_PASSWORD_POLICY_MIN_CHARACTERS: "${OC_PASSWORD_POLICY_MIN_CHARACTERS:-8}"
+      OC_PASSWORD_POLICY_MIN_LOWERCASE_CHARACTERS: "${OC_PASSWORD_POLICY_MIN_LOWERCASE_CHARACTERS:-1}"
+      OC_PASSWORD_POLICY_MIN_UPPERCASE_CHARACTERS: "${OC_PASSWORD_POLICY_MIN_UPPERCASE_CHARACTERS:-1}"
+      OC_PASSWORD_POLICY_MIN_DIGITS: "${OC_PASSWORD_POLICY_MIN_DIGITS:-1}"
+      OC_PASSWORD_POLICY_MIN_SPECIAL_CHARACTERS: "${OC_PASSWORD_POLICY_MIN_SPECIAL_CHARACTERS:-1}"
+    volumes:
+      - ./config/opencloud/csp.yaml:/etc/opencloud/csp.yaml
+      - ./config/opencloud/banned-password-list.txt:/etc/opencloud/banned-password-list.txt
+      # configure the .env file to use own paths instead of docker internal volumes
+      - ${OC_CONFIG_DIR:-opencloud-config}:/etc/opencloud
+      - ${OC_DATA_DIR:-opencloud-data}:/var/lib/opencloud
+      - ${OC_APPS_DIR:-./config/opencloud/apps}:/var/lib/opencloud/web/assets/apps
+    logging:
+      driver: local
+    restart: always
+
+  post-install:
+      command: 'chroot /host /bin/bash -c "xdg-open http://localhost:3420|| exit 0"'
       image: busybox
-      container_name: 'pre-install'
-      hostname: 'pre-install'
+      container_name: 'post-install'
+      hostname: 'post-install'
       volumes:
           - '/:/host'
       ipc: host
@@ -266,6 +1012,10 @@ services:
       privileged: true
       tty: true
       restart: "no"
+      depends_on:
+        s3:
+          condition: service_healthy
+          restart: false
 
 networks:
   net1:
@@ -277,27 +1027,159 @@ networks:
           gateway: 172.30.0.1
 
 volumes:
-  agola-data:
-  softserve-data:
+  docmost:
+  doc-redis_data:
   semaphore_data:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/semaphore/data"
+        map: "1000/0:@1000/@0"
   semaphore_config:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/semaphore/config"
+        map: "1000/0:@1000/@0"
   semaphore_tmp:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/semaphore/tmp"
+        map: "1000/0:@1000/@0"
   dockge:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/dockge"
+        map: "1000/0:@1000/@0"
   step:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/step"
+        map: "1000/0:@1000/@0"
+  woodpecker-server-data:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/woodpecker/data"
+        map: "1000/0:@1000/@0"
+  woodpecker-agent-config:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/woodpecker/agentconfig"
+        map: "1000/0:@1000/@0"
+  paperless-data:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/paperless/data"
+        map: "1000/0:@1000/@0"
+  paperless-media:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/paperless/media"
+        map: "1000/0:@1000/@0"
+  n8n_data:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/n8n/data"
+        map: "1000/0:@1000/@0"
+  netbox-config:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/netbox/config"
+        map: "1000/0:@1000/@0"
+  netbox-postgres-data:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/netbox/postgresdata"
+        map: "1000/0:@1000/@0"
+  netbox-redis-cache-data:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/netbox/redis-cache/data"
+        map: "1000/0:@1000/@0"
+  netbox-redis-data:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/netbox/redis/data"
+        map: "1000/0:@1000/@0"
+  netbox-reports-files:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/netbox/reports"
+        map: "1000/0:@1000/@0"
+  netbox-scripts-files:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/netbox/scripts"
+        map: "1000/0:@1000/@0"
+  coder_home:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/coder"
+        map: "1000/0:@1000/@0"
   data:
     driver: ghcr.io/studioetrange/bindfs:latest
     driver_opts:
-        sourcePath: "${PWD}/agola"
+        sourcePath: "${PWD}/data"
         map: "1000/0:@1000/@0"
-
+  mattermost-config:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/mattermost/config"
+        map: "1000/2000:@1000/@2000"
+  mattermost-data:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/mattermost/data"
+        map: "1000/2000:@1000/@2000"
+  mattermost-logs:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/mattermost/logs"
+        map: "1000/2000:@1000/@2000"
+  mattermost-plugins:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/mattermost/plugins"
+        map: "1000/2000:@1000/@2000"
+  mattermost-client-plugins:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/mattermost/client-plugins"
+        map: "1000/2000:@1000/@2000"
+  mattermost-bleve:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/mattermost/bleve"
+        map: "1000/2000:@1000/@2000"
 configs:
-  agola:
-    file: ./agola/config.yml
-  softserve:
-    file: ./softserve/config.yml
   dex:
     file: ./dex/config.yml
   seaweed_iam:
     file: ./seaweedfs/iam_dex.json
   caddyfile:
     file: ./caddy/Caddyfile
+  create-multiple-postgresql-databases:
+    content: |
+      #!/bin/bash
+
+      set -e
+      set -u
+
+      function create_user_and_database() {
+        local database=$$(echo $$1 | tr ',' ' ' | awk  '{print $$1}')
+        local owner=$$(echo $$1 | tr ',' ' ' | awk  '{print $$2}')
+        echo "  Creating user and database '$$database'"
+        psql -v ON_ERROR_STOP=1 --username "$$POSTGRES_USER" <<-EOSQL
+            CREATE USER $$owner;
+            ALTER USER $$owner WITH PASSWORD '$$POSTGRES_PASSWORD';
+            CREATE DATABASE $$database;
+            GRANT ALL PRIVILEGES ON DATABASE $$database TO $$owner;
+            ALTER DATABASE $$database OWNER TO $$owner;
+      EOSQL
+      }
+
+      if [ -n "$$POSTGRES_MULTIPLE_DATABASES" ]; then
+        echo "Multiple database creation requested: $$POSTGRES_MULTIPLE_DATABASES"
+        for db in $$(echo $$POSTGRES_MULTIPLE_DATABASES | tr '#' ' '); do
+          create_user_and_database $$db
+        done
+        echo "Multiple databases created"
+      fi
