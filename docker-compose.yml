@@ -1,7 +1,7 @@
----
+name: company
 services:
   pre-install:
-      command: 'chroot /host /bin/bash -c "docker plugin install --grant-all-permissions ghcr.io/studioetrange/bindfs:latest || true && docker plugin enable ghcr.io/studioetrange/bindfs:latest || exit 0"'
+      command: 'chroot /host /bin/bash -c "cd ${PWD} && docker plugin install --grant-all-permissions ghcr.io/studioetrange/bindfs:latest || true && docker plugin enable ghcr.io/studioetrange/bindfs:latest || true && exit 0"'
       image: busybox
       container_name: 'pre-install'
       hostname: 'pre-install'
@@ -13,17 +13,20 @@ services:
       privileged: true
       tty: true
       restart: "no"
+      labels:
+        - "company.pre-install=true"
   woodpecker-server:
     image: woodpeckerci/woodpecker-server:v3
     container_name: woodpecker-server
     hostname: 'woodpecker-server'
-    ports:
-      - 8000:8000
+    user: root
+    #ports:
+    #  - 8000:8000
     volumes:
       - woodpecker-server-data:/var/lib/woodpecker/
     environment:
       - WOODPECKER_OPEN=true
-      - WOODPECKER_HOST=http://172.30.0.20:8000
+      - WOODPECKER_HOST=http://172.30.0.21:8000
       - WOODPECKER_AGENT_SECRET=pssst
       - WOODPECKER_GITEA=true
       - WOODPECKER_GITEA_URL=http://172.30.0.3
@@ -32,25 +35,67 @@ services:
     networks:
       net1:
         ipv4_address: 172.30.0.21
-
+    depends_on:
+      gitea:
+        condition: service_started
+      gitea-hc:
+        condition: service_healthy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.woodpecker.rule=Host(`woodpecker.docker.localhost`)"
+      - "traefik.http.routers.woodpecker.entrypoints=websecure"
+      - "traefik.http.services.woodpecker.loadbalancer.server.port=8000"
+      - "traefik.http.routers.woodpecker.tls=true"
+      - "traefik.http.routers.woodpecker.tls.certresolver=stepca"
+  woodpecker-server-hc:
+      image: jrsmile/microcheck-sidecar:latest
+      container_name: 'woodpecker-server-hc'
+      restart: "always"
+      healthcheck:
+        test: ["CMD", "httpcheck", "http://localhost:8000"]
+        interval: 30s
+        timeout: 10s
+        retries: 5
+        start_period: 20s
+      network_mode: "service:woodpecker-server"
+      depends_on:
+        woodpecker-server:
+          condition: service_healthy
   woodpecker-agent:
     image: woodpeckerci/woodpecker-agent:v3
     container_name: woodpecker-agent
     hostname: 'woodpecker-agent'
+    user: root
     command: agent
     restart: always
     depends_on:
-      - woodpecker-server
+      woodpecker-server-hc:
+        condition: service_healthy
+      woodpecker-server:
+        condition: service_healthy
     volumes:
       - woodpecker-agent-config:/etc/woodpecker
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      - WOODPECKER_SERVER=172.30.0.20:9000
+      - WOODPECKER_SERVER=172.30.0.21:9000
       - WOODPECKER_AGENT_SECRET=pssst
     networks:
       net1:
         ipv4_address: 172.30.0.22
-
+  woodpecker-agent-hc:
+    image: jrsmile/microcheck-sidecar:latest
+    container_name: 'woodpecker-agent-hc'
+    restart: "always"
+    healthcheck:
+      test: ["CMD", "portcheck", "--port", "3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    network_mode: "service:woodpecker-agent"
+    depends_on:
+      woodpecker-agent:
+        condition: service_healthy
   gitea:
     image: docker.gitea.com/gitea:1.25.2
     container_name: gitea
@@ -64,95 +109,35 @@ services:
       - /etc/timezone:/etc/timezone:ro
       - /etc/localtime:/etc/localtime:ro
     ports:
-      - "3100:3000"
+      #- "3100:3000"
       - "222:22"
     networks:
       net1:
         ipv4_address: 172.30.0.3
-  master:
-    image: chrislusf/seaweedfs # use a remote image
-    container_name: master
-    hostname: 'master'
-    ports:
-      - 9333:9333
-      - 19333:19333
-      - 9324:9324
-    command: 'master -ip=master -ip.bind=0.0.0.0 -metricsPort=9324'
-    networks:
-      net1:
-        ipv4_address: 172.30.0.4
-  volume:
-    image: chrislusf/seaweedfs # use a remote image
-    container_name: volume
-    hostname: 'volume'
-    ports:
-      - 8080:8080
-      - 18080:18080
-      - 9325:9325
-    command: 'volume -ip=volume -mserver="master:9333" -ip.bind=0.0.0.0 -port=8080 -metricsPort=9325'
-    networks:
-      net1:
-        ipv4_address: 172.30.0.5
-    depends_on:
-      - master
-  filer:
-    image: chrislusf/seaweedfs # use a remote image
-    container_name: filer
-    hostname: 'filer'
-    ports:
-      - 8888:8888
-      - 18888:18888
-      - 9326:9326
-    command: 'filer -ip=filer -master="master:9333" -ip.bind=0.0.0.0 -metricsPort=9326'
-    networks:
-      net1:
-        ipv4_address: 172.30.0.6
-    tty: true
-    stdin_open: true
-    depends_on:
-      - master
-      - volume
-  s3:
-    image: chrislusf/seaweedfs # use a remote image
-    container_name: s3
-    hostname: 's3'
-    ports:
-      - 8333:8333
-      - 9327:9327
-    command: 's3 -filer="filer:8888" -ip.bind=0.0.0.0 -metricsPort=9327 -iam.config=/etc/seaweed/iam_dex.json'
-    configs:
-      - source: seaweed_iam
-        target: /etc/seaweed/iam_dex.json
-    networks:
-      net1:
-        ipv4_address: 172.30.0.7
-    depends_on:
-      - master
-      - volume
-      - filer
-    healthcheck:
-      test: ["CMD-SHELL", "sleep 29"]
-      interval: 10s
-      retries: 5
-      start_period: 30s
-      timeout: 30s
-  webdav:
-    image: chrislusf/seaweedfs # use a remote image
-    container_name: webdav
-    hostname: 'webdav'
-    ports:
-      - 7333:7333
-    command: 'webdav -filer="filer:8888"'
-    networks:
-      net1:
-        ipv4_address: 172.30.0.8
-    depends_on:
-      - master
-      - volume
-      - filer
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.gitea.rule=Host(`gitea.docker.localhost`)"
+      - "traefik.http.routers.gitea.entrypoints=websecure"
+      - "traefik.http.services.gitea.loadbalancer.server.port=3000"
+      - "traefik.http.routers.gitea.tls=true"
+      - "traefik.http.routers.gitea.tls.certresolver=stepca"
+  gitea-hc:
+      image: jrsmile/microcheck-sidecar:latest
+      container_name: 'gitea-hc'
+      restart: "always"
+      healthcheck:
+        test: ["CMD", "httpcheck", "http://localhost:3000"]
+        interval: 30s
+        timeout: 10s
+        retries: 5
+        start_period: 20s
+      network_mode: "service:gitea"
+      depends_on:
+        gitea:
+          condition: service_started
   semaphore:
-    ports:
-      - 3010:3000
+    #ports:
+    #  - 3010:3000
     image: semaphoreui/semaphore:v2.16.43
     container_name: semaphore
     hostname: 'semaphore'
@@ -171,6 +156,32 @@ services:
     networks:
       net1:
         ipv4_address: 172.30.0.9
+    depends_on:
+      gitea:
+        condition: service_started
+      gitea-hc:
+        condition: service_healthy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.semaphore.rule=Host(`semaphore.docker.localhost`)"
+      - "traefik.http.routers.semaphore.entrypoints=websecure"
+      - "traefik.http.services.semaphore.loadbalancer.server.port=3000"
+      - "traefik.http.routers.semaphore.tls=true"
+      - "traefik.http.routers.semaphore.tls.certresolver=stepca"
+  semaphore-hc:
+    image: jrsmile/microcheck-sidecar:latest
+    container_name: 'semaphore-hc'
+    restart: "always"
+    healthcheck:
+      test: ["CMD", "httpcheck", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    network_mode: "service:semaphore"
+    depends_on:
+      semaphore:
+        condition: service_started
   semaphore-runner:
     image: semaphoreui/runner:v2.16.43
     container_name: semaphore-runner
@@ -182,13 +193,15 @@ services:
     networks:
       net1:
         ipv4_address: 172.30.0.10
-
+    depends_on:
+      semaphore-hc:
+        condition: service_healthy
+      semaphore:
+        condition: service_started
   dex:
     image: dexidp/dex:latest
     container_name: dex
     hostname: 'dex'
-    ports:
-      - "5556:5556"
     configs:
       - source: dex
         target: /etc/dex/config.yaml
@@ -196,67 +209,133 @@ services:
     networks:
       net1:
         ipv4_address: 172.30.0.11
-
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dex.rule=Host(`dex.docker.localhost`)"
+      - "traefik.http.routers.dex.entrypoints=websecure"
+      - "traefik.http.services.dex.loadbalancer.server.port=5556"
+      - "traefik.http.routers.dex.tls=true"
+      - "traefik.http.routers.dex.tls.certresolver=stepca"
+    depends_on:
+      traefik:
+        condition: service_started
   ca:
     image: 'smallstep/step-ca:latest'
     container_name: 'ca'
     hostname: 'ca'
+    user: root
+    restart: always
     networks:
       net1:
         ipv4_address: 172.30.0.12
     ports:
-      - 9020:9000
-#    dns:
-#      - '${DNS1}'
-#      - '${DNS2}'
-    dns_search:
-      - '.internal'
+      - 9000:9000
+    dns:
+      - '172.30.0.50'
     environment:
-      # Name of Cert Authority (i.e., PrivateCorp CA). Visible on all issued certs.
       - "DOCKER_STEPCA_INIT_NAME=Local CA"
-      # Comma-separated list of hostnames/IP addresses the CA will accept requests on
-      - "DOCKER_STEPCA_INIT_DNS_NAMES=*"
-      # Name for the initial provisioner. Default is 'admin' if left null.
+      - "DOCKER_STEPCA_INIT_DNS_NAMES=ca,ca.docker.localhost"
       - "DOCKER_STEPCA_INIT_PROVISIONER_NAME=admin"
-      # Specify a password for encrypted CA Keys & Default CA Provisioner
       - "DOCKER_STEPCA_INIT_PASSWORD=admin"
-      # Set this to any non-null value to enable SSH cert support
       - "DOCKER_STEPCA_INIT_SSH=true"
+      - "DOCKER_STEPCA_INIT_ACME=true"
     volumes:
       - 'step:/home/step'
-
-  caddy:
-    image: caddy:latest
-    container_name: 'caddy'
-    hostname: 'caddy'
-    ports:
-      - 80:80
-      - 443:443
+    healthcheck:
+      test: ["CMD", "step", "ca", "health", "--ca-url", "https://ca:9000", "--root", "/home/step/certs/root_ca.crt"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      coredns:
+        condition: service_started
+      coredns-hc:
+        condition: service_healthy
+  coredns:
+    image: coredns/coredns:latest
+    container_name: coredns
+    hostname: 'coredns'
+    command: -conf /etc/coredns/Corefile -dns.port 53
     configs:
-      - source: caddyfile
-        target: /etc/caddy/Caddyfile
-    volumes:
-      - ./certs:/data
-    restart: always
+      - source: coredns
+        target: /etc/coredns/Corefile
+    networks:
+      net1:
+        ipv4_address: 172.30.0.50
+  coredns-hc:
+    image: jrsmile/microcheck-sidecar:latest
+    container_name: 'coredns-hc'
+    restart: "always"
+    healthcheck:
+      test: ["CMD", "httpcheck", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    network_mode: "service:coredns"
+    depends_on:
+      coredns:
+        condition: service_started
+  traefik:
+    image: "traefik:latest"
+    container_name: "traefik"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     networks:
       net1:
         ipv4_address: 172.30.0.13
-
-  dns:
-    image: defreitas/dns-proxy-server
-    container_name: 'dns'
-    hostname: 'dns'
-    volumes:
-      - '/var/run/docker.sock:/var/run/docker.sock'
+    command:
+      - --api=true
+      - --api.dashboard=true
+      - --log.level=INFO
+      - --accesslog=true
+      - --ping=true
+      - --ping.entryPoint=ping
+      - --entrypoints.ping.address=:8080
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=company
+      - --providers.docker.watch=true
+      - --entryPoints.web.address=:80
+      - --entryPoints.web.http.redirections.entrypoint.to=websecure
+      - --entryPoints.web.http.redirections.entrypoint.scheme=https
+      - --entryPoints.websecure.address=:443
+      - --entryPoints.websecure.http.tls=true
+      - --entryPoints.websecure.asDefault=true
+      - --entryPoints.websecure.http.tls.certresolver=stepca
+      - --certificatesresolvers.stepca.acme.tlschallenge=true
+      - --certificatesresolvers.stepca.acme.email=admin@localhost
+      - --certificatesresolvers.stepca.acme.caCertificates=/home/step/certs/root_ca.crt
+      - --certificatesresolvers.stepca.acme.caServerName=ca
+      - --certificatesresolvers.stepca.acme.storage=/stepca/acme.json
+      - --certificatesresolvers.stepca.acme.caServer=https://ca:9000/acme/acme/directory
     ports:
-      - '5380:5380'
-      - '5354:53/udp'
-      - '5354:53/tcp'
-    restart: unless-stopped
-    networks:
-      net1:
-        ipv4_address: 172.30.0.14
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "traefik-certs:/stepca"
+      - "step:/home/step:ro"
+    environment:
+      - LEGO_CA_CERTIFICATES=/home/step/certs/root_ca.crt
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api.entrypoints=websecure"
+      - "traefik.http.routers.api.rule=Host(`traefik.docker.localhost`)"
+      - "traefik.http.routers.api.service=api@internal"
+      - "traefik.http.routers.api.tls=true"
+      - "traefik.http.routers.api.tls.certresolver=stepca"
 
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck"]
+      interval: 1m30s
+      timeout: 30s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      ca:
+        condition: service_healthy
   dockpeek:
     image: dockpeek/dockpeek:latest
     container_name: dockpeek
@@ -267,57 +346,82 @@ services:
       - PASSWORD=admin # password
     # Server name for UI (optional, auto-detected from Docker API if not set)
     #  - DOCKER_HOST_NAME=
-    ports:
-      - "3420:8000"
+    #ports:
+    #  - "3420:8000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     restart: unless-stopped
     networks:
       net1:
         ipv4_address: 172.30.0.15
-    
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dockpeek.rule=Host(`dockpeek.docker.localhost`)"
+      - "traefik.http.routers.dockpeek.entrypoints=websecure"
+      - "traefik.http.services.dockpeek.loadbalancer.server.port=8000"
+      - "traefik.http.routers.dockpeek.tls=true"
+      - "traefik.http.routers.dockpeek.tls.certresolver=stepca"
+      - com.dnsdock.ip_addr=172.30.0.13
   prometheus:
     image: prom/prometheus
     container_name: prometheus
     hostname: 'prometheus'
     restart: unless-stopped
-    ports:
-      - 9090:9090
+    #ports:
+    #  - 9090:9090
     networks:
       net1:
         ipv4_address: 172.30.0.16
-
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.prometheus.rule=Host(`prometheus.docker.localhost`)"
+      - "traefik.http.routers.prometheus.entrypoints=websecure"
+      - "traefik.http.services.prometheus.loadbalancer.server.port=9090"
+      - "traefik.http.routers.prometheus.tls=true"
+      - "traefik.http.routers.prometheus.tls.certresolver=stepca"
   grafana:
     image: grafana/grafana-enterprise
     container_name: grafana
     hostname: 'grafana'
     restart: unless-stopped
-    ports:
-      - '3001:3000'
+    #ports:
+    #  - '3001:3000'
     networks:
       net1:
         ipv4_address: 172.30.0.17
-
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.rule=Host(`grafana.docker.localhost`)"
+      - "traefik.http.routers.grafana.entrypoints=websecure"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+      - "traefik.http.routers.grafana.tls=true"
+      - "traefik.http.routers.grafana.tls.certresolver=stepca"
   alpine:
-      image: qemux/qemu
-      container_name: alpine
-      environment:
-        BOOT: "alpine"
-      devices:
-        - /dev/kvm
-        - /dev/net/tun
-      cap_add:
-        - NET_ADMIN
-      ports:
-        - 8006:8006
-      volumes:
-        - ./qemu:/storage
-      restart: always
-      stop_grace_period: 2m
-      networks:
-        net1:
-          ipv4_address: 172.30.0.18
-
+    image: qemux/qemu
+    container_name: alpine
+    environment:
+      BOOT: "alpine"
+    devices:
+      - /dev/kvm
+      - /dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    #ports:
+    #  - 8006:8006
+    volumes:
+      - ./qemu:/storage
+    restart: always
+    stop_grace_period: 2m
+    networks:
+      net1:
+        ipv4_address: 172.30.0.18
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.alpine.rule=Host(`alpine.docker.localhost`)"
+      - "traefik.http.routers.alpine.entrypoints=websecure"
+      - "traefik.http.services.alpine.loadbalancer.server.port=8006"
+      - "traefik.http.routers.alpine.tls=true"
+      - "traefik.http.routers.alpine.tls.certresolver=stepca"
   postgres:
     image: postgres:latest
     container_name: postgres
@@ -342,18 +446,13 @@ services:
       - source: create-multiple-postgresql-databases
         target: /docker-entrypoint-initdb.d/create-multiple-postgresql-databases.sh
     healthcheck:
-          test:
-            [
-              "CMD-SHELL",
-              "pg_isready -U ${POSTGRES_USER:-username} -d ${POSTGRES_DB:-coder}",
-            ]
+          test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
           interval: 5s
           timeout: 5s
           retries: 5
     networks:
       net1:
         ipv4_address: 172.30.0.19
-
   mattermost:
     depends_on:
       - postgres
@@ -387,20 +486,26 @@ services:
       - MM_BLEVESETTINGS_INDEXDIR
       # additional settings
       - MM_SERVICESETTINGS_SITEURL
-    ports:
-      - 8065:8065
+    #ports:
+    #  - 8065:8065
     networks:
       net1:
         ipv4_address: 172.30.0.20
-  
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.mattermost.rule=Host(`mattermost.docker.localhost`)"
+      - "traefik.http.routers.mattermost.entrypoints=websecure"
+      - "traefik.http.services.mattermost.loadbalancer.server.port=8065"
+      - "traefik.http.routers.mattermost.tls=true"
+      - "traefik.http.routers.mattermost.tls.certresolver=stepca"
   headscale:
     image: docker.io/headscale/headscale:latest
     restart: unless-stopped
     container_name: headscale
     hostname: headscale
     ports:
-      - "127.0.0.1:8081:8080"
-      - "127.0.0.1:9091:9090"
+      - "8081:8080"
+      - "9091:9090"
     volumes:
       - ./headscale/config:/etc/headscale
       - ./headscale/lib:/var/lib/headscale
@@ -411,39 +516,44 @@ services:
     networks:
       net1:
         ipv4_address: 172.30.0.23
-
   passbolt:
-      image: passbolt/passbolt:latest-ce-non-root
-      container_name: passbolt
-      hostname: passbolt
-      restart: unless-stopped
-      depends_on:
-        - postgres
-      environment:
-        APP_FULL_BASE_URL: https://passbolt.local
-        DATASOURCES_DEFAULT_HOST: "postgres"
-        DATASOURCES_DEFAULT_USERNAME: "passbolt"
-        DATASOURCES_DEFAULT_PASSWORD: "P4ssb0lt"
-        DATASOURCES_DEFAULT_DATABASE: "passbolt"
-      volumes:
-        - ./passbolt/gpg_volume:/etc/passbolt/gpg
-        - ./passbolt/jwt_volume:/etc/passbolt/jwt
-      command:
-        [
-          "/usr/bin/wait-for.sh",
-          "-t",
-          "0",
-          "db:3306",
-          "--",
-          "/docker-entrypoint.sh",
-        ]
-      ports:
-      - 8088:8080
-      - 8443:4433
-      networks:
-        net1:
-          ipv4_address: 172.30.0.24
-
+    image: passbolt/passbolt:latest-ce-non-root
+    container_name: passbolt
+    hostname: passbolt
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      APP_FULL_BASE_URL: https://passbolt.docker.localhost
+      DATASOURCES_DEFAULT_HOST: "postgres"
+      DATASOURCES_DEFAULT_USERNAME: "passbolt"
+      DATASOURCES_DEFAULT_PASSWORD: "P4ssb0lt"
+      DATASOURCES_DEFAULT_DATABASE: "passbolt"
+    volumes:
+      - ./passbolt/gpg_volume:/etc/passbolt/gpg
+      - ./passbolt/jwt_volume:/etc/passbolt/jwt
+    command:
+      [
+        "/usr/bin/wait-for.sh",
+        "-t",
+        "0",
+        "db:3306",
+        "--",
+        "/docker-entrypoint.sh",
+      ]
+    ports:
+    - 8088:8080
+    - 8443:4433
+    networks:
+      net1:
+        ipv4_address: 172.30.0.24
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.passbolt.rule=Host(`passbolt.docker.localhost`)"
+      - "traefik.http.routers.passbolt.entrypoints=websecure"
+      - "traefik.http.services.passbolt.loadbalancer.server.port=8443"
+      - "traefik.http.routers.passbolt.tls=true"
+      - "traefik.http.routers.passbolt.tls.certresolver=stepca"
   n8n:
     image: n8nio/n8n:1.111.0
     container_name: n8n
@@ -454,14 +564,20 @@ services:
       - N8N_RUNNERS_BROKER_LISTEN_ADDRESS=0.0.0.0
       - N8N_RUNNERS_AUTH_TOKEN=your-secret-here
       - N8N_NATIVE_PYTHON_RUNNER=true
-    ports:
-      - "5678:5678"
+    #ports:
+    #  - "5678:5678"
     volumes:
       - n8n_data:/home/node/.n8n
     networks:
       net1:
         ipv4_address: 172.30.0.25
-
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.n8n.rule=Host(`n8n.docker.localhost`)"
+      - "traefik.http.routers.n8n.entrypoints=websecure"
+      - "traefik.http.services.n8n.loadbalancer.server.port=5678"
+      - "traefik.http.routers.n8n.tls=true"
+      - "traefik.http.routers.n8n.tls.certresolver=stepca"
   n8n-runner:
     image: n8nio/runners:1.111.0
     container_name: n8n-runner
@@ -474,7 +590,6 @@ services:
     networks:
       net1:
         ipv4_address: 172.30.0.26
-
   rustdesk:
     container_name: rustdesk
     image: rustdesk/rustdesk-server:latest
@@ -484,11 +599,9 @@ services:
     volumes:
       - ./rustdesk/hbbs/data:/root
     network_mode: "host"
-
     depends_on:
       - rustdesk-relay
     restart: unless-stopped
-
   rustdesk-relay:
     container_name: rustdesk-relay
     image: rustdesk/rustdesk-server:latest
@@ -497,7 +610,6 @@ services:
       - ./rustdesk/hbbr/data:/root
     network_mode: "host"
     restart: unless-stopped
-
   pless-redis:
     image: docker.io/valkey/valkey:8.1-alpine
     container_name: pless-redis
@@ -508,7 +620,12 @@ services:
     networks:
       net1:
         ipv4_address: 172.30.0.27
-
+    healthcheck:
+      test: '[ $$(valkey-cli --pass "redis" ping) = ''PONG'' ]'
+      start_period: 5s
+      timeout: 3s
+      interval: 1s
+      retries: 5
   paperless-ngx:
     image: ghcr.io/paperless-ngx/paperless-ngx:latest
     container_name: paperless-ngx
@@ -519,8 +636,8 @@ services:
       - pless-redis
       - gotenberg
       - tika
-    ports:
-      - "8100:8000"
+    #ports:
+    #  - "8100:8000"
     volumes:
       - paperless-data:/usr/src/paperless/data
       - paperless-media:/usr/src/paperless/media
@@ -535,6 +652,13 @@ services:
     networks:
       net1:
         ipv4_address: 172.30.0.28
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.paperless.rule=Host(`paperless.docker.localhost`)"
+      - "traefik.http.routers.paperless.entrypoints=websecure"
+      - "traefik.http.services.paperless.loadbalancer.server.port=8000"
+      - "traefik.http.routers.paperless.tls=true"
+      - "traefik.http.routers.paperless.tls.certresolver=stepca"
   gotenberg:
     image: docker.io/gotenberg/gotenberg:8.25
     container_name: gotenberg
@@ -555,7 +679,6 @@ services:
     networks:
       net1:
         ipv4_address: 172.30.0.30
-
   paperless-gpt:
     # Use one of these image sources:
     image: icereed/paperless-gpt:latest # Docker Hub
@@ -565,7 +688,7 @@ services:
     environment:
       PAPERLESS_BASE_URL: "http://paperless-ngx:8000"
       PAPERLESS_API_TOKEN: "your_paperless_api_token"
-      PAPERLESS_PUBLIC_URL: "http://paperless.mydomain.com" # Optional
+      PAPERLESS_PUBLIC_URL: "http://paperless.docker.localhost" # Optional
       MANUAL_TAG: "paperless-gpt" # Optional, default: paperless-gpt
       AUTO_TAG: "paperless-gpt-auto" # Optional, default: paperless-gpt-auto
       # LLM Configuration - Choose one:
@@ -661,7 +784,6 @@ services:
     networks:
       net1:
         ipv4_address: 172.30.0.31
-
   ollama:
     image: docker.io/ollama/ollama:latest
     container_name: ollama
@@ -671,7 +793,7 @@ services:
     volumes:
       - .:/code
       - ./ollama/ollama:/root/.ollama
-    pull_policy: always
+    #pull_policy: always
     tty: true
     restart: always
     environment:
@@ -680,19 +802,24 @@ services:
     networks:
       net1:
         ipv4_address: 172.30.0.32
-
   it-tools:
     container_name: it-tools
     hostname: it-tools
     image: sharevb/it-tools:latest
     pull_policy: always
     restart: unless-stopped
-    ports:
-      - 8181:8080
+    #ports:
+    #  - 8181:8080
     networks:
       net1:
         ipv4_address: 172.30.0.33
-
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ittools.rule=Host(`ittools.docker.localhost`)"
+      - "traefik.http.routers.ittools.entrypoints=websecure"
+      - "traefik.http.services.ittools.loadbalancer.server.port=8080"
+      - "traefik.http.routers.ittools.tls=true"
+      - "traefik.http.routers.ittools.tls.certresolver=stepca"
   onlyoffice-documentserver:
     build:
       context: .
@@ -713,9 +840,9 @@ services:
       #- JWT_SECRET=secret
       #- JWT_HEADER=Authorization
       #- JWT_IN_BODY=true
-    ports:
-      - '4080:80'
-      - '4443:443'
+    #ports:
+    #  - '4080:80'
+    #  - '4443:443'
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/info/info.json"]
       interval: 30s
@@ -726,15 +853,21 @@ services:
     restart: always
     stop_grace_period: 60s
     volumes:
-       - /var/www/onlyoffice/Data
-       - /var/log/onlyoffice
-       - /var/lib/onlyoffice/documentserver/App_Data/cache/files
-       - /var/www/onlyoffice/documentserver-example/public/files
-       - /usr/share/fonts
+       - onlyoffice-data:/var/www/onlyoffice/Data
+       - onlyoffice-logs:/var/log/onlyoffice
+       - onlyoffice-cache:/var/lib/onlyoffice/documentserver/App_Data/cache/files
+       - onlyoffice-public:/var/www/onlyoffice/documentserver-example/public/files
+       - onlyoffice-fonts:/usr/share/fonts
     networks:
       net1:
         ipv4_address: 172.30.0.34
-       
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.onlyoffice.rule=Host(`onlyoffice.docker.localhost`)"
+      - "traefik.http.routers.onlyoffice.entrypoints=websecure"
+      - "traefik.http.services.onlyoffice.loadbalancer.server.port=443"
+      - "traefik.http.routers.onlyoffice.tls=true"
+      - "traefik.http.routers.onlyoffice.tls.certresolver=stepca"
   onlyoffice-rabbitmq:
     container_name: onlyoffice-rabbitmq
     hostname: onlyoffice-rabbitmq
@@ -751,18 +884,21 @@ services:
     networks:
       net1:
         ipv4_address: 172.30.0.35
-
   netbox:
     image: lscr.io/linuxserver/netbox:latest
     container_name: netbox
     hostname: netbox
+    user: root
     depends_on:
-      - postgres
-      - redis
-      - redis-cache
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
     environment:
-      - PUID=1000
-      - PGID=1000
+      - PUID=0
+      - PGID=0
       - TZ=Etc/UTC
       - SUPERUSER_EMAIL=admin@example.com
       - SUPERUSER_PASSWORD=admin
@@ -777,7 +913,7 @@ services:
       - REDIS_PASSWORD=redis
       - REDIS_DB_TASK=
       - REDIS_DB_CACHE=
-      - BASE_PATH= #optional
+      - BASE_PATH="/"
       - REMOTE_AUTH_ENABLED= #optional
       - REMOTE_AUTH_BACKEND= #optional
       - REMOTE_AUTH_HEADER= #optional
@@ -786,13 +922,33 @@ services:
       - REMOTE_AUTH_DEFAULT_PERMISSIONS= #optional
     volumes:
       - netbox-config:/etc/netbox/config
-    ports:
-      - 8110:8000
+    #ports:
+    #  - 8110:8000
     restart: unless-stopped
     networks:
       net1:
         ipv4_address: 172.30.0.36
-
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.netbox.rule=Host(`netbox.docker.localhost`)"
+      - "traefik.http.routers.netbox.entrypoints=websecure"
+      - "traefik.http.services.netbox.loadbalancer.server.port=8000"
+      - "traefik.http.routers.netbox.tls=true"
+      - "traefik.http.routers.netbox.tls.certresolver=stepca"
+  netbox-hc:
+    image: jrsmile/microcheck-sidecar:latest
+    container_name: 'netbox-hc'
+    restart: "always"
+    healthcheck:
+      test: ["CMD", "portcheck", "--port", "8000"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    network_mode: "service:netbox"
+    depends_on:
+      netbox:
+        condition: service_started
   redis:
     image: docker.io/valkey/valkey:8.1-alpine
     container_name: redis
@@ -812,7 +968,6 @@ services:
     networks:
       net1:
         ipv4_address: 172.30.0.38
-
   redis-cache:
     image: docker.io/valkey/valkey:8.1-alpine
     container_name: redis-cache
@@ -828,19 +983,39 @@ services:
       net1:
         ipv4_address: 172.30.0.39
   webhook:
-      command: '-verbose -hooks=/etc/webhook/hooks.json -hotreload'
-      image: lwlook/webhook
-      volumes:
-          - '/var/run/docker.sock:/var/run/docker.sock'
-          - './webhook/scripts:/opt/scripts'
-          - './webhook/webhook:/etc/webhook'
-      container_name: webhook
-      ports:
-          - '9000:9000'
-      networks:
-        net1:
-          ipv4_address: 172.30.0.42
-
+    command: '-verbose -hooks=/etc/webhook/hooks.json -hotreload'
+    image: lwlook/webhook
+    volumes:
+        - '/var/run/docker.sock:/var/run/docker.sock'
+        - './webhook/scripts:/opt/scripts'
+        - './webhook/webhook:/etc/webhook'
+    container_name: webhook
+    #ports:
+    #    - '19111:9000'
+    networks:
+      net1:
+        ipv4_address: 172.30.0.42
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.webhook.rule=Host(`webhook.docker.localhost`)"
+      - "traefik.http.routers.webhook.entrypoints=websecure"
+      - "traefik.http.services.webhook.loadbalancer.server.port=9000"
+      - "traefik.http.routers.webhook.tls=true"
+      - "traefik.http.routers.webhook.tls.certresolver=stepca"
+  webhook-hc:
+    image: jrsmile/microcheck-sidecar:latest
+    container_name: 'webhook-hc'
+    restart: "always"
+    healthcheck:
+      test: ["CMD", "portcheck", "--port", "9000"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    network_mode: "service:webhook"
+    depends_on:
+      webhook:
+        condition: service_started
   neko:
     image: "ghcr.io/m1k1o/neko/firefox:latest"
     container_name: neko
@@ -848,7 +1023,7 @@ services:
     restart: "unless-stopped"
     shm_size: "4gb"
     ports:
-      - "8085:8080"
+      #- "8085:8080"
       - "52000-52100:52000-52100/udp"
     environment:
       NEKO_DESKTOP_SCREEN: 1280x720@30
@@ -860,32 +1035,60 @@ services:
     networks:
       net1:
         ipv4_address: 172.30.0.43
-
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.neko.rule=Host(`neko.docker.localhost`)"
+      - "traefik.http.routers.neko.entrypoints=websecure"
+      - "traefik.http.services.neko.loadbalancer.server.port=8080"
+      - "traefik.http.routers.neko.tls=true"
+      - "traefik.http.routers.neko.tls.certresolver=stepca"
   wetty:
-      command: '--ssh-host=172.30.0.1'
-      image: wettyoss/wetty
-      container_name: wetty
-      hostname: wetty
-      ports:
-          - '1234:3000'
-      networks:
-        net1:
-          ipv4_address: 172.30.0.44
+    command: '--base=/ --ssh-host=172.30.0.1'
+    image: wettyoss/wetty
+    container_name: wetty
+    hostname: wetty
+    #ports:
+    #    - '1234:3000'
+    networks:
+      net1:
+        ipv4_address: 172.30.0.44
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.wetty.rule=Host(`wetty.docker.localhost`)"
+      - "traefik.http.routers.wetty.entrypoints=websecure"
+      - "traefik.http.services.wetty.loadbalancer.server.port=3000"
+      - "traefik.http.routers.wetty.tls=true"
+      - "traefik.http.routers.wetty.tls.certresolver=stepca"
+  wetty-hc:
+    image: jrsmile/microcheck-sidecar:latest
+    container_name: 'wetty-hc'
+    restart: "always"
+    healthcheck:
+      test: ["CMD", "portcheck", "--port", "3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    network_mode: "service:wetty"
+    depends_on:
+      wetty:
+        condition: service_started
   coder:
     # This MUST be stable for our documentation and
     # other automations.
     image: ghcr.io/coder/coder:latest
     container_name: coder
+    user: root
     hostname: coder
-    ports:
-      - "7080:7080"
+    #ports:
+    #  - "7080:7080"
     environment:
       CODER_PG_CONNECTION_URL: "postgresql://coder:postgres@postgres/coder?sslmode=disable"
       CODER_HTTP_ADDRESS: "0.0.0.0:7080"
       # You'll need to set CODER_ACCESS_URL to an IP or domain
       # that workspaces can reach. This cannot be localhost
       # or 127.0.0.1 for non-Docker templates!
-      CODER_ACCESS_URL: "http://127.0.0.1:7080"
+      CODER_ACCESS_URL: "http://coder:7080"
     # If the coder user does not have write permissions on
     # the docker socket, you can uncomment the following
     # lines and set the group ID to one that has write
@@ -901,28 +1104,59 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-
+    networks:
+      net1:
+        ipv4_address: 172.30.0.45
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.coder.rule=Host(`coder.docker.localhost`)"
+      - "traefik.http.routers.coder.entrypoints=websecure"
+      - "traefik.http.services.coder.loadbalancer.server.port=7080"
+      - "traefik.http.routers.coder.tls=true"
+      - "traefik.http.routers.coder.tls.certresolver=stepca"
+  coder-hc:
+    image: jrsmile/microcheck-sidecar:latest
+    container_name: 'coder-hc'
+    restart: "always"
+    healthcheck:
+      test: ["CMD", "httpcheck", "http://localhost:7080"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    network_mode: "service:coder"
+    depends_on:
+      coder:
+        condition: service_started
   docmost:
     image: docmost/docmost:latest
     container_name: docmost
     hostname: docmost
     depends_on:
-      - postgres
-      - doc-redis
+      postgres:
+        condition: service_healthy
+      doc-redis:
+        condition: service_healthy
     environment:
       APP_URL: "http://localhost:3000"
       APP_SECRET: "3fc0dd9af11abb9f2585049f8990b588"
       DATABASE_URL: "postgresql://docmost:postgres@postgres:5432/docmost?schema=public"
       REDIS_URL: "redis://doc-redis:6379"
-    ports:
-      - "3000:3000"
+    #ports:
+    #  - "3000:3000"
     restart: unless-stopped
     volumes:
       - docmost:/app/data/storage
     networks:
       net1:
         ipv4_address: 172.30.0.40
-
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.docmost.rule=Host(`docmost.docker.localhost`)"
+      - "traefik.http.routers.docmost.entrypoints=websecure"
+      - "traefik.http.services.docmost.loadbalancer.server.port=3000"
+      - "traefik.http.routers.docmost.tls=true"
+      - "traefik.http.routers.docmost.tls.certresolver=stepca"
   doc-redis:
     image: docker.io/valkey/valkey:8.1-alpine
     container_name: doc-redis
@@ -932,16 +1166,36 @@ services:
       - doc-redis_data:/data
     networks:
       net1:
-        ipv4_address: 172.30.0.41
-
+        ipv4_address: 172.30.0.46
+    healthcheck:
+      test: '[ $$(valkey-cli --pass "redis" ping) = ''PONG'' ]'
+      start_period: 5s
+      timeout: 3s
+      interval: 1s
+      retries: 5
+  docmost-hc:
+      image: jrsmile/microcheck-sidecar:latest
+      container_name: 'docmost-hc'
+      restart: "always"
+      healthcheck:
+        test: ["CMD", "httpcheck", "http://localhost:3000"]
+        interval: 30s
+        timeout: 10s
+        retries: 5
+        start_period: 20s
+      network_mode: "service:docmost"
+      depends_on:
+        docmost:
+          condition: service_started
   opencloud:
     image: opencloudeu/opencloud-rolling:latest
     # changelog: https://github.com/opencloud-eu/opencloud/tree/main/changelog
     # release notes: https://docs.opencloud.eu/opencloud_release_notes.html
-    user: 1000
+    user: root
+    container_name: opencloud
     networks:
       net1:
-        ipv4_address: 172.30.0.42
+        ipv4_address: 172.30.0.47
     entrypoint:
       - /bin/sh
     # run opencloud init to initialize a configuration file with random secrets
@@ -952,19 +1206,19 @@ services:
       # enable services that are not started automatically
       OC_ADD_RUN_SERVICES: ${START_ADDITIONAL_SERVICES}
       OC_URL: https://${OC_DOMAIN:-cloud.opencloud.test}${TRAEFIK_PORT_HTTPS:+:}${TRAEFIK_PORT_HTTPS:-}
-      OC_LOG_LEVEL: ${LOG_LEVEL:-info}
-      OC_LOG_COLOR: "${LOG_PRETTY:-false}"
-      OC_LOG_PRETTY: "${LOG_PRETTY:-false}"
+      OC_LOG_LEVEL: "info"
+      OC_LOG_COLOR: "false"
+      OC_LOG_PRETTY: "false"
       # do not use SSL between the reverse proxy and OpenCloud
       PROXY_TLS: "false"
       # INSECURE: needed if OpenCloud / reverse proxy is using self generated certificates
-      OC_INSECURE: "${INSECURE:-false}"
+      OC_INSECURE: "true"
       # basic auth (not recommended, but needed for eg. WebDav clients that do not support OpenID Connect)
       PROXY_ENABLE_BASIC_AUTH: "${PROXY_ENABLE_BASIC_AUTH:-false}"
       # demo users
-      IDM_CREATE_DEMO_USERS: "${DEMO_USERS:-false}"
+      IDM_CREATE_DEMO_USERS: "false"
       # admin password
-      IDM_ADMIN_PASSWORD: "${INITIAL_ADMIN_PASSWORD}"
+      IDM_ADMIN_PASSWORD: "admin"
       # email server (if configured)
       NOTIFICATIONS_SMTP_HOST: "${SMTP_HOST}"
       NOTIFICATIONS_SMTP_PORT: "${SMTP_PORT}"
@@ -989,18 +1243,57 @@ services:
       OC_PASSWORD_POLICY_MIN_DIGITS: "${OC_PASSWORD_POLICY_MIN_DIGITS:-1}"
       OC_PASSWORD_POLICY_MIN_SPECIAL_CHARACTERS: "${OC_PASSWORD_POLICY_MIN_SPECIAL_CHARACTERS:-1}"
     volumes:
-      - ./config/opencloud/csp.yaml:/etc/opencloud/csp.yaml
-      - ./config/opencloud/banned-password-list.txt:/etc/opencloud/banned-password-list.txt
-      # configure the .env file to use own paths instead of docker internal volumes
-      - ${OC_CONFIG_DIR:-opencloud-config}:/etc/opencloud
-      - ${OC_DATA_DIR:-opencloud-data}:/var/lib/opencloud
-      - ${OC_APPS_DIR:-./config/opencloud/apps}:/var/lib/opencloud/web/assets/apps
+      - opencloud-config:/etc/opencloud
+      - opencloud-data:/var/lib/opencloud
+      - opencloud-apps:/var/lib/opencloud/web/assets/apps
     logging:
       driver: local
     restart: always
-
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.opencloud.rule=Host(`opencloud.docker.localhost`)"
+      - "traefik.http.routers.opencloud.entrypoints=web"
+      - "traefik.http.services.opencloud.loadbalancer.server.port=8080"
+  rustfs:
+    image: 'rustfs/rustfs:latest'
+    user: root
+    environment:
+        - RUSTFS_SERVER_DOMAINS=internal.docker
+        - RUSTFS_CONSOLE_ENABLE=true
+        - RUSTFS_SECRET_KEY=rustfsadmin
+        - RUSTFS_ACCESS_KEY=rustfsadmin
+    volumes:
+        - 'rustfs-data:/data'
+    ports:
+        # - '9001:9001'
+        - '9002:9000'
+    container_name: rustfs
+    networks:
+      net1:
+        ipv4_address: 172.30.0.48
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.rustfs.rule=Host(`rustfs.docker.localhost`)"
+      - "traefik.http.routers.rustfs.entrypoints=websecure"
+      - "traefik.http.services.rustfs.loadbalancer.server.port=9001"
+      - "traefik.http.routers.rustfs.tls=true"
+      - "traefik.http.routers.rustfs.tls.certresolver=stepca"
+  rustfs-hc:
+      image: jrsmile/microcheck-sidecar:latest
+      container_name: 'rustfs-hc'
+      restart: "always"
+      healthcheck:
+        test: ["CMD", "portcheck", "--port","9001"]
+        interval: 30s
+        timeout: 10s
+        retries: 5
+        start_period: 20s
+      network_mode: "service:rustfs"
+      depends_on:
+        rustfs:
+          condition: service_started
   post-install:
-      command: 'chroot /host /bin/bash -c "xdg-open http://localhost:3420|| exit 0"'
+      command: 'chroot /host /bin/bash -c "echo Done || exit 0"'
       image: busybox
       container_name: 'post-install'
       hostname: 'post-install'
@@ -1013,9 +1306,11 @@ services:
       tty: true
       restart: "no"
       depends_on:
-        s3:
-          condition: service_healthy
+        rustfs:
+          condition: service_started
           restart: false
+        rustfs-hc:
+          condition: service_healthy
 
 networks:
   net1:
@@ -1027,8 +1322,26 @@ networks:
           gateway: 172.30.0.1
 
 volumes:
+  traefik-certs:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/traefik/certs"
+        map: "1000/0:@1000/@0"
   docmost:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/docmost/data"
+        map: "1000/0:@1000/@0"
   doc-redis_data:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/docmost/redis"
+        map: "1000/0:@1000/@0"
+  rustfs-data:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/rustfs/data"
+        map: "1000/0:@1000/@0"
   semaphore_data:
     driver: ghcr.io/studioetrange/bindfs:latest
     driver_opts:
@@ -1149,13 +1462,78 @@ volumes:
     driver_opts:
         sourcePath: "${PWD}/mattermost/bleve"
         map: "1000/2000:@1000/@2000"
+  opencloud-config:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/opencloud/config"
+        map: "1000/0:@1000/@0"
+  opencloud-data:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/opencloud/data"
+        map: "1000/0:@1000/@0"
+  opencloud-apps:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/opencloud/apps"
+        map: "1000/0:@1000/@0"
+  onlyoffice-data:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/onlyoffice/data"
+        map: "1000/0:@1000/@0"
+  onlyoffice-logs:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/onlyoffice/logs"
+        map: "1000/0:@1000/@0"
+  onlyoffice-cache:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/onlyoffice/cache"
+        map: "1000/0:@1000/@0"
+  onlyoffice-public:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/onlyoffice/public"
+        map: "1000/0:@1000/@0"
+  onlyoffice-fonts:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/onlyoffice/fonts"
+        map: "1000/0:@1000/@0"
+
 configs:
+  coredns:
+    content: |
+      .:53 {
+          errors
+          log
+          health
+          template IN A docker.localhost {
+              answer "{{ .Name }} 60 IN A 172.30.0.13"
+          }
+          forward . 8.8.8.8 1.1.1.1
+      }
   dex:
-    file: ./dex/config.yml
-  seaweed_iam:
-    file: ./seaweedfs/iam_dex.json
-  caddyfile:
-    file: ./caddy/Caddyfile
+    content: |
+      issuer: http://dex.docker.localhost/dex
+      storage:
+        type: memory
+      web:
+        http: 0.0.0.0:5556
+      staticClients:
+        - id: example-app
+          redirectURIs:
+            - 'http://localhost:5555/callback'
+          name: 'Example App'
+          secret: ZXhhbXBsZS1hcHAtc2VjcmV0
+      enablePasswordDB: true
+      staticPasswords:
+        - email: "admin@example.com"
+          hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"
+          username: "admin"
+          userID: "1234"
   create-multiple-postgresql-databases:
     content: |
       #!/bin/bash
