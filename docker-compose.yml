@@ -15,6 +15,31 @@ services:
       restart: "no"
       labels:
         - "company.pre-install=true"
+
+  ldap:
+    image: lldap/lldap:stable
+    container_name: ldap
+    networks:
+      net1:
+        ipv4_address: 172.30.0.49
+    volumes:
+      - lldap_data:/data
+    environment:
+      - UID=1000
+      - GID=1000
+      - TZ=Europe/Berlin
+      - LLDAP_JWT_SECRET=Supergeheim # verwende hier einen zufällligen Token. Ist nicht das Passwort.
+      - LLDAP_KEY_SEED=Supersupergeheim # verwende hier einen zufällligen Token. Ist nicht das Passwort.
+      - LLDAP_LDAP_BASE_DN=dc=company,dc=de
+      - LLDAP_LDAP_USER_PASS=Userpasswort1234
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.lldap.rule=Host(`ldap.docker.localhost`)
+      - traefik.http.routers.lldap.entrypoints=websecure
+      - traefik.http.services.lldap.loadbalancer.server.port=17170
+      - traefik.http.routers.lldap.service=lldap
+      - traefik.http.routers.lldap.tls.certresolver=stepca
+
   woodpecker-server:
     image: woodpeckerci/woodpecker-server:v3
     container_name: woodpecker-server
@@ -121,6 +146,9 @@ services:
       - "traefik.http.services.gitea.loadbalancer.server.port=3000"
       - "traefik.http.routers.gitea.tls=true"
       - "traefik.http.routers.gitea.tls.certresolver=stepca"
+    depends_on:
+      traefik:
+        condition: service_started
   gitea-hc:
       image: jrsmile/microcheck-sidecar:latest
       container_name: 'gitea-hc'
@@ -228,8 +256,8 @@ services:
     networks:
       net1:
         ipv4_address: 172.30.0.12
-    ports:
-      - 9000:9000
+    #ports:
+    #  - 9000:9000
     dns:
       - '172.30.0.50'
     environment:
@@ -255,6 +283,7 @@ services:
     image: coredns/coredns:latest
     container_name: coredns
     hostname: 'coredns'
+    restart: always
     command: -conf /etc/coredns/Corefile -dns.port 53
     configs:
       - source: coredns
@@ -265,7 +294,7 @@ services:
   coredns-hc:
     image: jrsmile/microcheck-sidecar:latest
     container_name: 'coredns-hc'
-    restart: "always"
+    restart: always
     healthcheck:
       test: ["CMD", "httpcheck", "http://localhost:8080/health"]
       interval: 30s
@@ -328,13 +357,17 @@ services:
       - "traefik.http.routers.api.tls.certresolver=stepca"
 
     healthcheck:
-      test: ["CMD", "traefik", "healthcheck"]
-      interval: 1m30s
-      timeout: 30s
-      retries: 5
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
       start_period: 30s
     depends_on:
       ca:
+        condition: service_healthy
+      coredns:
+        condition: service_started
+      coredns-hc:
         condition: service_healthy
   dockpeek:
     image: dockpeek/dockpeek:latest
@@ -362,6 +395,9 @@ services:
       - "traefik.http.routers.dockpeek.tls=true"
       - "traefik.http.routers.dockpeek.tls.certresolver=stepca"
       - com.dnsdock.ip_addr=172.30.0.13
+    depends_on:
+      traefik:
+        condition: service_started
   prometheus:
     image: prom/prometheus
     container_name: prometheus
@@ -379,6 +415,9 @@ services:
       - "traefik.http.services.prometheus.loadbalancer.server.port=9090"
       - "traefik.http.routers.prometheus.tls=true"
       - "traefik.http.routers.prometheus.tls.certresolver=stepca"
+    depends_on:
+      traefik:
+        condition: service_started
   grafana:
     image: grafana/grafana-enterprise
     container_name: grafana
@@ -396,6 +435,9 @@ services:
       - "traefik.http.services.grafana.loadbalancer.server.port=3000"
       - "traefik.http.routers.grafana.tls=true"
       - "traefik.http.routers.grafana.tls.certresolver=stepca"
+    depends_on:
+      traefik:
+        condition: service_started
   alpine:
     image: qemux/qemu
     container_name: alpine
@@ -422,6 +464,9 @@ services:
       - "traefik.http.services.alpine.loadbalancer.server.port=8006"
       - "traefik.http.routers.alpine.tls=true"
       - "traefik.http.routers.alpine.tls.certresolver=stepca"
+    depends_on:
+      traefik:
+        condition: service_started
   postgres:
     image: postgres:latest
     container_name: postgres
@@ -437,7 +482,7 @@ services:
     volumes:
       - ./postgres/:/var/lib/postgresql/
     environment:
-      - POSTGRES_MULTIPLE_DATABASES=mattermost,mattermost# passbolt,passbolt# paperless,paperless# netbox,netbox# docmost,docmost# coder,coder
+      - POSTGRES_MULTIPLE_DATABASES=mattermost,mattermost# passbolt,passbolt# paperless,paperless# netbox,netbox# docmost,docmost# coder,coder# onlyoffice,onlyoffice
       - POSTGRES_PASSWORD=postgres
       - POSTGRES_USER=postgres
       - POSTGRES_DB=postgres
@@ -455,7 +500,10 @@ services:
         ipv4_address: 172.30.0.19
   mattermost:
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+      traefik:
+        condition: service_started
     image: mattermost/mattermost-team-edition:latest
     container_name: mattermost
     hostname: mattermost
@@ -507,9 +555,9 @@ services:
       - "8081:8080"
       - "9091:9090"
     volumes:
-      - ./headscale/config:/etc/headscale
-      - ./headscale/lib:/var/lib/headscale
-      - ./headscale/run:/var/run/headscale
+      - headscale-config:/etc/headscale
+      - headscale-lib:/var/lib/headscale
+      - headscale-run:/var/run/headscale
     command: serve
     healthcheck:
         test: ["CMD", "headscale", "health"]
@@ -521,8 +569,6 @@ services:
     container_name: passbolt
     hostname: passbolt
     restart: unless-stopped
-    depends_on:
-      - postgres
     environment:
       APP_FULL_BASE_URL: https://passbolt.docker.localhost
       DATASOURCES_DEFAULT_HOST: "postgres"
@@ -554,10 +600,16 @@ services:
       - "traefik.http.services.passbolt.loadbalancer.server.port=8443"
       - "traefik.http.routers.passbolt.tls=true"
       - "traefik.http.routers.passbolt.tls.certresolver=stepca"
+    depends_on:
+      traefik:
+        condition: service_started
+      postgres:
+        condition: service_healthy
   n8n:
-    image: n8nio/n8n:1.111.0
+    image: n8nio/n8n:latest
     container_name: n8n
     hostname: n8n
+    user: root
     environment:
       - N8N_RUNNERS_ENABLED=true
       - N8N_RUNNERS_MODE=external
@@ -578,15 +630,19 @@ services:
       - "traefik.http.services.n8n.loadbalancer.server.port=5678"
       - "traefik.http.routers.n8n.tls=true"
       - "traefik.http.routers.n8n.tls.certresolver=stepca"
+    depends_on:
+      traefik:
+        condition: service_started
   n8n-runner:
-    image: n8nio/runners:1.111.0
+    image: n8nio/runners:latest
     container_name: n8n-runner
     hostname: n8n-runner
     environment:
       - N8N_RUNNERS_TASK_BROKER_URI=http://n8n:5679
       - N8N_RUNNERS_AUTH_TOKEN=your-secret-here
     depends_on:
-      - n8n
+      n8n:
+        condition: service_started
     networks:
       net1:
         ipv4_address: 172.30.0.26
@@ -631,11 +687,18 @@ services:
     container_name: paperless-ngx
     hostname: paperless-ngx
     restart: unless-stopped
+    user: root
     depends_on:
-      - postgres
-      - pless-redis
-      - gotenberg
-      - tika
+      postgres:
+        condition: service_healthy
+      pless-redis:
+        condition: service_healthy
+      gotenberg:
+        condition: service_started
+      tika:
+        condition: service_started
+      traefik:
+        condition: service_started
     #ports:
     #  - "8100:8000"
     volumes:
@@ -646,9 +709,13 @@ services:
     environment:
       PAPERLESS_REDIS: redis://pless-redis:6379
       PAPERLESS_DBHOST: postgres
+      PAPERLESS_DBNAME: paperless
+      PAPERLESS_DBUSER: paperless
+      PAPERLESS_DBPASS: postgres
       PAPERLESS_TIKA_ENABLED: 1
       PAPERLESS_TIKA_GOTENBERG_ENDPOINT: http://gotenberg:3000
       PAPERLESS_TIKA_ENDPOINT: http://tika:9998
+      PAPERLESS_URL: https://paperless.docker.localhost
     networks:
       net1:
         ipv4_address: 172.30.0.28
@@ -820,14 +887,14 @@ services:
       - "traefik.http.services.ittools.loadbalancer.server.port=8080"
       - "traefik.http.routers.ittools.tls=true"
       - "traefik.http.routers.ittools.tls.certresolver=stepca"
+    depends_on:
+      traefik:
+        condition: service_started
   onlyoffice-documentserver:
     build:
       context: .
     image: onlyoffice/documentserver #[-de,-ee]
     container_name: onlyoffice-documentserver
-    depends_on:
-      - postgres
-      - onlyoffice-rabbitmq
     environment:
       - DB_TYPE=postgres
       - DB_HOST=postgres
@@ -868,6 +935,13 @@ services:
       - "traefik.http.services.onlyoffice.loadbalancer.server.port=443"
       - "traefik.http.routers.onlyoffice.tls=true"
       - "traefik.http.routers.onlyoffice.tls.certresolver=stepca"
+    depends_on:
+      traefik:
+        condition: service_started
+      onlyoffice-rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
   onlyoffice-rabbitmq:
     container_name: onlyoffice-rabbitmq
     hostname: onlyoffice-rabbitmq
@@ -896,6 +970,8 @@ services:
         condition: service_healthy
       redis-cache:
         condition: service_healthy
+      traefik:
+        condition: service_started
     environment:
       - PUID=0
       - PGID=0
@@ -1002,6 +1078,9 @@ services:
       - "traefik.http.services.webhook.loadbalancer.server.port=9000"
       - "traefik.http.routers.webhook.tls=true"
       - "traefik.http.routers.webhook.tls.certresolver=stepca"
+    depends_on:
+      traefik:
+        condition: service_started
   webhook-hc:
     image: jrsmile/microcheck-sidecar:latest
     container_name: 'webhook-hc'
@@ -1042,6 +1121,9 @@ services:
       - "traefik.http.services.neko.loadbalancer.server.port=8080"
       - "traefik.http.routers.neko.tls=true"
       - "traefik.http.routers.neko.tls.certresolver=stepca"
+    depends_on:
+      traefik:
+        condition: service_started
   wetty:
     command: '--base=/ --ssh-host=172.30.0.1'
     image: wettyoss/wetty
@@ -1059,6 +1141,9 @@ services:
       - "traefik.http.services.wetty.loadbalancer.server.port=3000"
       - "traefik.http.routers.wetty.tls=true"
       - "traefik.http.routers.wetty.tls.certresolver=stepca"
+    depends_on:
+      traefik:
+        condition: service_started
   wetty-hc:
     image: jrsmile/microcheck-sidecar:latest
     container_name: 'wetty-hc'
@@ -1104,6 +1189,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      traefik:
+        condition: service_started
     networks:
       net1:
         ipv4_address: 172.30.0.45
@@ -1137,6 +1224,8 @@ services:
         condition: service_healthy
       doc-redis:
         condition: service_healthy
+      traefik:
+        condition: service_started
     environment:
       APP_URL: "http://localhost:3000"
       APP_SECRET: "3fc0dd9af11abb9f2585049f8990b588"
@@ -1204,8 +1293,8 @@ services:
     command: ["-c", "opencloud init || true; opencloud server"]
     environment:
       # enable services that are not started automatically
-      OC_ADD_RUN_SERVICES: ${START_ADDITIONAL_SERVICES}
-      OC_URL: https://${OC_DOMAIN:-cloud.opencloud.test}${TRAEFIK_PORT_HTTPS:+:}${TRAEFIK_PORT_HTTPS:-}
+      OC_ADD_RUN_SERVICES: true
+      OC_URL: https://opencloud.docker.localhost
       OC_LOG_LEVEL: "info"
       OC_LOG_COLOR: "false"
       OC_LOG_PRETTY: "false"
@@ -1220,19 +1309,19 @@ services:
       # admin password
       IDM_ADMIN_PASSWORD: "admin"
       # email server (if configured)
-      NOTIFICATIONS_SMTP_HOST: "${SMTP_HOST}"
-      NOTIFICATIONS_SMTP_PORT: "${SMTP_PORT}"
-      NOTIFICATIONS_SMTP_SENDER: "${SMTP_SENDER:-OpenCloud Notifications <notifications@cloud.opencloud.test>}"
-      NOTIFICATIONS_SMTP_USERNAME: "${SMTP_USERNAME}"
-      NOTIFICATIONS_SMTP_PASSWORD: "${SMTP_PASSWORD}"
-      NOTIFICATIONS_SMTP_INSECURE: "${SMTP_INSECURE:-false}"
-      NOTIFICATIONS_SMTP_AUTHENTICATION: "${SMTP_AUTHENTICATION}"
-      NOTIFICATIONS_SMTP_ENCRYPTION: "${SMTP_TRANSPORT_ENCRYPTION:-none}"
+      NOTIFICATIONS_SMTP_HOST: "mailserver"
+      NOTIFICATIONS_SMTP_PORT: "25"
+      NOTIFICATIONS_SMTP_SENDER: "OpenCloud Notifications <notifications@cloud.opencloud.test>"
+      NOTIFICATIONS_SMTP_USERNAME: ""
+      NOTIFICATIONS_SMTP_PASSWORD: ""
+      NOTIFICATIONS_SMTP_INSECURE: "true"
+      NOTIFICATIONS_SMTP_AUTHENTICATION: ""
+      NOTIFICATIONS_SMTP_ENCRYPTION: "none"
       FRONTEND_ARCHIVER_MAX_SIZE: "10000000000"
-      FRONTEND_CHECK_FOR_UPDATES: "${CHECK_FOR_UPDATES:-true}"
-      PROXY_CSP_CONFIG_FILE_LOCATION: /etc/opencloud/csp.yaml
+      FRONTEND_CHECK_FOR_UPDATES: "false"
+      # PROXY_CSP_CONFIG_FILE_LOCATION: /etc/opencloud/csp.yaml
       # enable to allow using the banned passwords list
-      OC_PASSWORD_POLICY_BANNED_PASSWORDS_LIST: banned-password-list.txt
+      # OC_PASSWORD_POLICY_BANNED_PASSWORDS_LIST: banned-password-list.txt
       # control the password enforcement and policy for public shares
       OC_SHARING_PUBLIC_SHARE_MUST_HAVE_PASSWORD: "${OC_SHARING_PUBLIC_SHARE_MUST_HAVE_PASSWORD:-true}"
       OC_SHARING_PUBLIC_WRITEABLE_SHARE_MUST_HAVE_PASSWORD: "${OC_SHARING_PUBLIC_WRITEABLE_SHARE_MUST_HAVE_PASSWORD:-true}"
@@ -1254,6 +1343,9 @@ services:
       - "traefik.http.routers.opencloud.rule=Host(`opencloud.docker.localhost`)"
       - "traefik.http.routers.opencloud.entrypoints=web"
       - "traefik.http.services.opencloud.loadbalancer.server.port=8080"
+    depends_on:
+      traefik:
+        condition: service_started
   rustfs:
     image: 'rustfs/rustfs:latest'
     user: root
@@ -1278,39 +1370,99 @@ services:
       - "traefik.http.services.rustfs.loadbalancer.server.port=9001"
       - "traefik.http.routers.rustfs.tls=true"
       - "traefik.http.routers.rustfs.tls.certresolver=stepca"
+    depends_on:
+      traefik:
+        condition: service_started
   rustfs-hc:
-      image: jrsmile/microcheck-sidecar:latest
-      container_name: 'rustfs-hc'
-      restart: "always"
-      healthcheck:
-        test: ["CMD", "portcheck", "--port","9001"]
-        interval: 30s
-        timeout: 10s
-        retries: 5
-        start_period: 20s
-      network_mode: "service:rustfs"
-      depends_on:
-        rustfs:
-          condition: service_started
+    image: jrsmile/microcheck-sidecar:latest
+    container_name: 'rustfs-hc'
+    restart: "always"
+    healthcheck:
+      test: ["CMD", "portcheck", "--port","9001"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    network_mode: "service:rustfs"
+    depends_on:
+      rustfs:
+        condition: service_started
+
+  mailserver:
+    image: ghcr.io/docker-mailserver/docker-mailserver:latest
+    container_name: mailserver
+    # Provide the FQDN of your mail server here (Your DNS MX record should point to this value)
+    hostname: mailserver.docker.localhost
+    ports:
+      - "25:25"
+      - "465:465"
+      - "587:587"
+      - "993:993"
+    volumes:
+      - mail-data:/var/mail/
+      - mail-state:/var/mail-state/
+      - mail-logs:/var/log/mail/
+      - mail-config:/tmp/docker-mailserver/
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - ENABLE_RSPAMD=1
+      - ENABLE_CLAMAV=1
+      - ENABLE_FAIL2BAN=0
+    restart: always
+    networks:
+      net1:
+        ipv4_address: 172.30.0.52
+
+  arcane:
+    image: ghcr.io/getarcaneapp/arcane:latest
+    container_name: arcane
+    restart: unless-stopped
+    #ports:
+    #  - 3552:3552
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - arcane-data:/app/data
+    environment:
+      - APP_URL=https://arcane.docker.localhost
+      - PUID=1000
+      - PGID=1000
+      - ENCRYPTION_KEY=880d5998162f7f469e4515e02af1bd97bfe612fdbc70cfd4856f9084ff1d0f83
+      - JWT_SECRET=733637cfc9d54b90879b35acbd61687851833ea2ac37030d821bf3b8306ceeff
+      - LOG_LEVEL=info
+      - LOG_JSON=false
+      - OIDC_ENABLED=false
+      - DATABASE_URL=file:data/arcane.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(2500)&_txlock=immediate
+    networks:
+      net1:
+        ipv4_address: 172.30.0.51
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.arcane.rule=Host(`arcane.docker.localhost`)"
+      - "traefik.http.routers.arcane.entrypoints=websecure"
+      - "traefik.http.services.arcane.loadbalancer.server.port=3552"
+      - "traefik.http.routers.arcane.tls=true"
+      - "traefik.http.routers.arcane.tls.certresolver=stepca"
   post-install:
-      command: 'chroot /host /bin/bash -c "echo Done || exit 0"'
-      image: busybox
-      container_name: 'post-install'
-      hostname: 'post-install'
-      volumes:
-          - '/:/host'
-      ipc: host
-      pid: host
-      network_mode: "host"
-      privileged: true
-      tty: true
-      restart: "no"
-      depends_on:
-        rustfs:
-          condition: service_started
-          restart: false
-        rustfs-hc:
-          condition: service_healthy
+    command: 'chroot /host /bin/bash -c "echo Done || exit 0"'
+    image: busybox
+    container_name: 'post-install'
+    hostname: 'post-install'
+    volumes:
+        - '/:/host'
+    ipc: host
+    pid: host
+    network_mode: "host"
+    privileged: true
+    tty: true
+    restart: "no"
+    depends_on:
+      rustfs:
+        condition: service_started
+        restart: false
+      rustfs-hc:
+        condition: service_healthy
+      traefik:
+        condition: service_started
 
 networks:
   net1:
@@ -1322,6 +1474,51 @@ networks:
           gateway: 172.30.0.1
 
 volumes:
+  arcane-data:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/arcane/data"
+        map: "1000/1000:@1000/@1000"
+  headscale-config:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/headscale/config"
+        map: "1000/0:@1000/@0"
+  headscale-lib:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/headscale/lib"
+        map: "1000/0:@1000/@0"
+  headscale-run:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/headscale/run"
+        map: "1000/0:@1000/@0"
+  mail-data:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/mailserver/data"
+        map: "1000/0:@1000/@0"
+  mail-state:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/mailserver/state"
+        map: "1000/0:@1000/@0"
+  mail-logs:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/mailserver/logs"
+        map: "1000/0:@1000/@0"
+  mail-config:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/mailserver/config"
+        map: "1000/0:@1000/@0"
+  lldap_data:
+    driver: ghcr.io/studioetrange/bindfs:latest
+    driver_opts:
+        sourcePath: "${PWD}/lldap/data"
+        map: "1000/1000:@1000/@1000"
   traefik-certs:
     driver: ghcr.io/studioetrange/bindfs:latest
     driver_opts:
@@ -1381,12 +1578,12 @@ volumes:
     driver: ghcr.io/studioetrange/bindfs:latest
     driver_opts:
         sourcePath: "${PWD}/paperless/data"
-        map: "1000/0:@1000/@0"
+        map: "1000/1000:@1000/@1000"
   paperless-media:
     driver: ghcr.io/studioetrange/bindfs:latest
     driver_opts:
         sourcePath: "${PWD}/paperless/media"
-        map: "1000/0:@1000/@0"
+        map: "1000/1000:@1000/@1000"
   n8n_data:
     driver: ghcr.io/studioetrange/bindfs:latest
     driver_opts:
@@ -1507,9 +1704,9 @@ configs:
   coredns:
     content: |
       .:53 {
+          health :8080
           errors
           log
-          health
           template IN A docker.localhost {
               answer "{{ .Name }} 60 IN A 172.30.0.13"
           }
